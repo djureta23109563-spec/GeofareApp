@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "283081297575",
+    "project_id": "geofare-79da3",
+    "storage_bucket": "geofare-79da3.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:283081297575:android:7db6aa5e2b9b94c7e31582",
+        "android_client_info": {
+          "package_name": "com.example.geofare"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDJ0GxlM85A7brMFLJvlio4306IvOgCEew"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
