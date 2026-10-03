@@ -1,6 +1,9 @@
 package com.example.geofare
 
 import android.Manifest
+import android.app.Activity
+import android.content.Context
+import android.content.Intent
 import android.annotation.SuppressLint
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
@@ -14,7 +17,9 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
+import android.util.Patterns
 
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -62,6 +67,9 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
+
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -70,6 +78,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.rememberCoroutineScope
 
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -121,20 +130,37 @@ import java.util.Date
 import java.util.Hashtable
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.TimeUnit
 
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
+import androidx.credentials.CredentialManager
+import androidx.credentials.CustomCredential
+import androidx.credentials.GetCredentialRequest
+import androidx.credentials.exceptions.GetCredentialException
+
+import com.google.android.libraries.identity.googleid.GetGoogleIdOption
+import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
+import com.google.android.libraries.identity.googleid.GoogleIdTokenParsingException
+
+import com.google.firebase.FirebaseException
+import com.google.firebase.auth.EmailAuthProvider
 import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.auth.GoogleAuthProvider
+import com.google.firebase.auth.PhoneAuthCredential
+import com.google.firebase.auth.PhoneAuthOptions
+import com.google.firebase.auth.PhoneAuthProvider
+import com.google.firebase.auth.UserProfileChangeRequest
 import com.google.firebase.auth.FirebaseUser
 import com.google.firebase.firestore.DocumentSnapshot
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.ListenerRegistration
 
 
+
 /* =========================================================
-   FIREBASE
-   Passenger app uses Anonymous Authentication and listens
-   for driver confirmation from the website.
+   FIREBASE / AUTHENTICATION
    ========================================================= */
 
 val geoFareFirebaseAuth: FirebaseAuth
@@ -144,55 +170,333 @@ val geoFareFirestore: FirebaseFirestore
     get() = FirebaseFirestore.getInstance()
 
 
+data class GeoFareUserProfile(
+    val fullName: String = "",
+    val email: String = "",
+    val phoneNumber: String = ""
+)
+
+
+fun hasAuthenticatedGeoFareUser(): Boolean {
+    val user = geoFareFirebaseAuth.currentUser
+    return user != null && !user.isAnonymous
+}
+
+
 fun ensureFirebaseAuthentication(
     onSuccess: (FirebaseUser) -> Unit,
     onFailure: (Exception) -> Unit
 ) {
+    val user = geoFareFirebaseAuth.currentUser
 
-    val auth =
-        geoFareFirebaseAuth
-
-    val currentUser =
-        auth.currentUser
-
-    if (currentUser != null) {
-
-        onSuccess(
-            currentUser
+    if (user != null && !user.isAnonymous) {
+        onSuccess(user)
+    } else {
+        onFailure(
+            IllegalStateException(
+                "Please sign in to your GeoFare account before starting a trip."
+            )
         )
+    }
+}
 
-        return
+
+fun normalizePhoneNumber(input: String): String {
+    val cleaned = input.trim().replace("[^0-9+]".toRegex(), "")
+
+    return when {
+        cleaned.startsWith("+") -> {
+            "+" + cleaned.drop(1).filter { it.isDigit() }
+        }
+
+        cleaned.startsWith("63") && cleaned.length >= 12 -> {
+            "+$cleaned"
+        }
+
+        cleaned.startsWith("09") && cleaned.length == 11 -> {
+            "+63" + cleaned.substring(1)
+        }
+
+        cleaned.startsWith("9") && cleaned.length == 10 -> {
+            "+63$cleaned"
+        }
+
+        else -> {
+            cleaned.filter { it.isDigit() }
+        }
+    }
+}
+
+
+fun isValidPhoneNumber(input: String): Boolean {
+    val normalized = normalizePhoneNumber(input)
+
+    if (!normalized.startsWith("+")) {
+        return false
     }
 
-    auth
-        .signInAnonymously()
+    val digits = normalized.drop(1)
 
-        .addOnSuccessListener { result ->
+    return digits.length in 10..15
+}
 
-            val user = result.user
 
-            if (user != null) {
+fun friendlyFirebaseAuthError(exception: Exception): String {
+    val raw = exception.message.orEmpty()
 
+    return when {
+        raw.contains("invalid-credential", ignoreCase = true) ||
+                raw.contains("INVALID_LOGIN_CREDENTIALS", ignoreCase = true) ->
+            "The email/phone number or password is incorrect."
+
+        raw.contains("wrong-password", ignoreCase = true) ->
+            "The password is incorrect."
+
+        raw.contains("user-not-found", ignoreCase = true) ->
+            "No GeoFare account was found for that login."
+
+        raw.contains("email-already-in-use", ignoreCase = true) ->
+            "That email address is already registered."
+
+        raw.contains("weak-password", ignoreCase = true) ->
+            "Choose a stronger password with at least 8 characters."
+
+        raw.contains("invalid-email", ignoreCase = true) ->
+            "Enter a valid email address."
+
+        raw.contains("too-many-requests", ignoreCase = true) ->
+            "Too many attempts. Please wait a moment and try again."
+
+        raw.contains("network-request-failed", ignoreCase = true) ->
+            "Network connection failed. Check your internet connection."
+
+        raw.contains("quota-exceeded", ignoreCase = true) ->
+            "The authentication service is temporarily unavailable."
+
+        raw.isBlank() ->
+            "Authentication failed. Please try again."
+
+        else ->
+            raw
+    }
+}
+
+
+fun saveGeoFareUserProfile(
+    user: FirebaseUser,
+    fullName: String,
+    phoneNumber: String,
+    onSuccess: () -> Unit,
+    onFailure: (Exception) -> Unit
+) {
+    val profile = hashMapOf<String, Any?>(
+        "uid" to user.uid,
+        "fullName" to fullName.trim(),
+        "email" to (user.email ?: ""),
+        "phoneNumber" to phoneNumber.trim(),
+        "updatedAt" to com.google.firebase.firestore.FieldValue.serverTimestamp()
+    )
+
+    geoFareFirestore
+        .collection("profiles")
+        .document(user.uid)
+        .set(
+            profile,
+            com.google.firebase.firestore.SetOptions.merge()
+        )
+        .addOnSuccessListener {
+            onSuccess()
+        }
+        .addOnFailureListener { exception ->
+            onFailure(exception)
+        }
+}
+
+
+fun loadGeoFareUserProfile(
+    user: FirebaseUser,
+    onSuccess: (GeoFareUserProfile) -> Unit,
+    onFailure: (Exception) -> Unit
+) {
+    geoFareFirestore
+        .collection("profiles")
+        .document(user.uid)
+        .get()
+        .addOnSuccessListener { document ->
+            if (!document.exists()) {
                 onSuccess(
-                    user
-                )
-
-            } else {
-
-                onFailure(
-                    IllegalStateException(
-                        "Firebase anonymous sign-in succeeded but returned no user."
+                    GeoFareUserProfile(
+                        fullName = user.displayName.orEmpty(),
+                        email = user.email.orEmpty(),
+                        phoneNumber = user.phoneNumber.orEmpty()
                     )
                 )
+                return@addOnSuccessListener
             }
-        }
 
-        .addOnFailureListener { exception ->
-
-            onFailure(
-                exception
+            onSuccess(
+                GeoFareUserProfile(
+                    fullName = document.getString("fullName")
+                        ?.takeIf { it.isNotBlank() }
+                        ?: user.displayName.orEmpty(),
+                    email = document.getString("email")
+                        ?.takeIf { it.isNotBlank() }
+                        ?: user.email.orEmpty(),
+                    phoneNumber = document.getString("phoneNumber")
+                        ?.takeIf { it.isNotBlank() }
+                        ?: user.phoneNumber.orEmpty()
+                )
             )
         }
+        .addOnFailureListener { exception ->
+            onFailure(exception)
+        }
+}
+
+
+fun updateGeoFareDisplayName(
+    user: FirebaseUser,
+    fullName: String,
+    onSuccess: () -> Unit,
+    onFailure: (Exception) -> Unit
+) {
+    val request = UserProfileChangeRequest.Builder()
+        .setDisplayName(fullName.trim())
+        .build()
+
+    user.updateProfile(request)
+        .addOnSuccessListener {
+            onSuccess()
+        }
+        .addOnFailureListener { exception ->
+            onFailure(exception)
+        }
+}
+
+
+suspend fun completeGeoFareGoogleSignIn(
+    context: Context,
+    onSuccess: (FirebaseUser) -> Unit,
+    onFailure: (Exception) -> Unit
+) {
+    try {
+        val resourceId = context.resources.getIdentifier(
+            "default_web_client_id",
+            "string",
+            context.packageName
+        )
+
+        if (resourceId == 0) {
+            onFailure(
+                IllegalStateException(
+                    "Google Sign-In is not configured. Enable Google authentication in Firebase and make sure default_web_client_id is available."
+                )
+            )
+            return
+        }
+
+        val webClientId = context.getString(resourceId)
+
+        val googleIdOption = GetGoogleIdOption.Builder()
+            .setServerClientId(webClientId)
+            .setFilterByAuthorizedAccounts(false)
+            .setAutoSelectEnabled(false)
+            .build()
+
+        val request = GetCredentialRequest.Builder()
+            .addCredentialOption(googleIdOption)
+            .build()
+
+        val credentialManager =
+            CredentialManager.create(context)
+
+        val result = credentialManager.getCredential(
+            context = context,
+            request = request
+        )
+
+        val credential = result.credential
+
+        if (
+            credential is CustomCredential &&
+            credential.type ==
+            GoogleIdTokenCredential.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL
+        ) {
+            val googleIdTokenCredential =
+                try {
+                    GoogleIdTokenCredential.createFrom(
+                        credential.data
+                    )
+                } catch (exception: GoogleIdTokenParsingException) {
+                    onFailure(
+                        IllegalStateException(
+                            "Google returned an invalid sign-in credential.",
+                            exception
+                        )
+                    )
+                    return
+                }
+
+            val idToken =
+                googleIdTokenCredential.idToken
+
+            if (idToken.isBlank()) {
+                onFailure(
+                    IllegalStateException(
+                        "Google did not return an ID token. Check the Firebase Google sign-in configuration."
+                    )
+                )
+                return
+            }
+
+            val firebaseCredential =
+                GoogleAuthProvider.getCredential(
+                    idToken,
+                    null
+                )
+
+            geoFareFirebaseAuth
+                .signInWithCredential(firebaseCredential)
+                .addOnSuccessListener { resultAuth ->
+                    val user =
+                        resultAuth.user
+
+                    if (user == null) {
+                        onFailure(
+                            IllegalStateException(
+                                "Google sign-in completed but no Firebase user was returned."
+                            )
+                        )
+                        return@addOnSuccessListener
+                    }
+
+                    saveGeoFareUserProfile(
+                        user = user,
+                        fullName = user.displayName.orEmpty(),
+                        phoneNumber = user.phoneNumber.orEmpty(),
+                        onSuccess = {
+                            onSuccess(user)
+                        },
+                        onFailure = { profileException ->
+                            onFailure(profileException)
+                        }
+                    )
+                }
+                .addOnFailureListener { exception ->
+                    onFailure(exception)
+                }
+        } else {
+            onFailure(
+                IllegalStateException(
+                    "The selected credential was not a Google ID token."
+                )
+            )
+        }
+    } catch (exception: GetCredentialException) {
+        onFailure(exception)
+    } catch (exception: Exception) {
+        onFailure(exception)
+    }
 }
 
 
@@ -200,46 +504,60 @@ fun saveTripToFirestore(
     tripId: String,
     plate: String,
     pickup: Location?,
+    pickupAddress: String,
     destination: GeoPoint?,
+    destinationAddress: String,
     distanceMeters: Double,
     fare: Double,
     timestamp: String,
+    pickupAcquiredAtEpochMs: Long?,
+    destinationConfirmedAtEpochMs: Long?,
+    fareComputationStartEpochMs: Long?,
+    fareDisplayedAtEpochMs: Long?,
+    fareComputationLatencyMs: Long?,
     onSuccess: () -> Unit,
     onFailure: (Exception) -> Unit
 ) {
-
     ensureFirebaseAuthentication(
-
         onSuccess = { user ->
-
             val tripData =
                 hashMapOf<String, Any?>(
                     "tripId" to tripId,
                     "passengerUid" to user.uid,
-                    "plate" to plate.ifBlank {
-                        "UNKNOWN"
-                    },
-                    "pickupLat" to (
-                            pickup?.latitude ?: 0.0
-                            ),
-                    "pickupLng" to (
-                            pickup?.longitude ?: 0.0
-                            ),
-                    "destinationLat" to (
-                            destination?.latitude ?: 0.0
-                            ),
-                    "destinationLng" to (
-                            destination?.longitude ?: 0.0
-                            ),
-                    "distanceKm" to (
-                            distanceMeters / 1000.0
-                            ),
+                    "plate" to plate.ifBlank { "UNKNOWN" },
+                    "pickupLat" to (pickup?.latitude ?: 0.0),
+                    "pickupLng" to (pickup?.longitude ?: 0.0),
+                    "pickupAddress" to pickupAddress.ifBlank { "Current Location" },
+                    "destinationLat" to (destination?.latitude ?: 0.0),
+                    "destinationLng" to (destination?.longitude ?: 0.0),
+                    "destinationAddress" to destinationAddress.ifBlank { "Selected Destination" },
+                    "distanceKm" to (distanceMeters / 1000.0),
                     "fare" to fare,
                     "passengerTimestamp" to timestamp,
                     "status" to "PENDING",
                     "routeStatus" to "WAITING_FOR_DRIVER",
                     "createdAt" to com.google.firebase.firestore.FieldValue.serverTimestamp()
                 )
+
+            pickupAcquiredAtEpochMs?.let {
+                tripData["pickupAcquiredAtEpochMs"] = it
+            }
+
+            destinationConfirmedAtEpochMs?.let {
+                tripData["destinationConfirmedAtEpochMs"] = it
+            }
+
+            fareComputationStartEpochMs?.let {
+                tripData["fareComputationStartEpochMs"] = it
+            }
+
+            fareDisplayedAtEpochMs?.let {
+                tripData["fareDisplayedAtEpochMs"] = it
+            }
+
+            fareComputationLatencyMs?.let {
+                tripData["fareComputationLatencyMs"] = it
+            }
 
             geoFareFirestore
                 .collection("trips")
@@ -249,17 +567,12 @@ fun saveTripToFirestore(
                     com.google.firebase.firestore.SetOptions.merge()
                 )
                 .addOnSuccessListener {
-
                     onSuccess()
                 }
                 .addOnFailureListener { exception ->
-
-                    onFailure(
-                        exception
-                    )
+                    onFailure(exception)
                 }
         },
-
         onFailure = onFailure
     )
 }
@@ -271,48 +584,26 @@ fun listenForDriverConfirmation(
     onDeclined: () -> Unit,
     onError: (Exception) -> Unit
 ): ListenerRegistration {
-
     return geoFareFirestore
         .collection("trips")
         .document(tripId)
         .addSnapshotListener { snapshot: DocumentSnapshot?, error: Exception? ->
-
             if (error != null) {
-
-                onError(
-                    error
-                )
-
+                onError(error)
                 return@addSnapshotListener
             }
 
-            if (
-                snapshot == null ||
-                !snapshot.exists()
-            ) {
-
+            if (snapshot == null || !snapshot.exists()) {
                 return@addSnapshotListener
             }
 
-            val status =
-                snapshot.getString(
-                    "status"
-                )
-
-            when (status) {
-
+            when (snapshot.getString("status")) {
                 "CONFIRMED",
                 "ACTIVE",
                 "ON_ROUTE",
-                "ROUTE_DEVIATION" -> {
+                "ROUTE_DEVIATION" -> onConfirmed()
 
-                    onConfirmed()
-                }
-
-                "DECLINED" -> {
-
-                    onDeclined()
-                }
+                "DECLINED" -> onDeclined()
             }
         }
 }
@@ -378,21 +669,13 @@ fun loadPassengerTripHistory(
                                     document.getDouble("fare")
                                         ?: 0.0
 
-                                val pickupLat =
-                                    document.getDouble("pickupLat")
-                                        ?: 0.0
+                                val pickupAddress =
+                                    document.getString("pickupAddress")
+                                        ?: "Current Location"
 
-                                val pickupLng =
-                                    document.getDouble("pickupLng")
-                                        ?: 0.0
-
-                                val destinationLat =
-                                    document.getDouble("destinationLat")
-                                        ?: 0.0
-
-                                val destinationLng =
-                                    document.getDouble("destinationLng")
-                                        ?: 0.0
+                                val destinationAddress =
+                                    document.getString("destinationAddress")
+                                        ?: "Selected Destination"
 
                                 val completedTimestamp =
                                     document.getTimestamp("completedAt")
@@ -421,18 +704,8 @@ fun loadPassengerTripHistory(
                                     plate = plate,
                                     distanceKm = distanceKm,
                                     fare = fare,
-                                    pickup = String.format(
-                                        Locale.US,
-                                        "%.6f, %.6f",
-                                        pickupLat,
-                                        pickupLng
-                                    ),
-                                    destination = String.format(
-                                        Locale.US,
-                                        "%.6f, %.6f",
-                                        destinationLat,
-                                        destinationLng
-                                    ),
+                                    pickup = pickupAddress,
+                                    destination = destinationAddress,
                                     status = status,
                                     completedAt = completedLabel,
                                     sortTime = sortTime
@@ -628,59 +901,149 @@ class MainActivity : ComponentActivity() {
    ========================================================= */
 
 
+
 @Composable
 fun GeoFareApp() {
 
     var currentScreen by remember {
-        mutableStateOf("HOME")
+        mutableStateOf("SPLASH")
     }
 
     var detectedPlate by remember { mutableStateOf("") }
     var pickupLocation by remember { mutableStateOf<Location?>(null) }
+    var pickupAddress by remember { mutableStateOf("") }
     var destinationLocation by remember { mutableStateOf<GeoPoint?>(null) }
+    var selectedDestinationInfo by remember {
+        mutableStateOf<DestinationPlaceInfo?>(null)
+    }
+
     var routeDistanceMeters by remember { mutableStateOf<Double?>(null) }
     var routeDurationSeconds by remember { mutableStateOf<Double?>(null) }
     var calculatedFare by remember { mutableStateOf<Double?>(null) }
+
+    var pickupAcquiredAtEpochMs by remember { mutableStateOf<Long?>(null) }
+    var destinationConfirmedAtEpochMs by remember { mutableStateOf<Long?>(null) }
+    var fareComputationStartEpochMs by remember { mutableStateOf<Long?>(null) }
+    var fareComputationStartElapsedMs by remember { mutableStateOf<Long?>(null) }
+    var fareDisplayedAtEpochMs by remember { mutableStateOf<Long?>(null) }
+    var fareComputationLatencyMs by remember { mutableStateOf<Long?>(null) }
+
     var tripId by remember { mutableStateOf("") }
     var qrPayload by remember { mutableStateOf("") }
     var firebaseError by remember { mutableStateOf("") }
     var completionTimestamp by remember { mutableStateOf("") }
     var selectedHistoryTrip by remember { mutableStateOf<TripHistoryItem?>(null) }
+    var settingsReturnScreen by remember { mutableStateOf("HOME") }
 
     fun resetTrip() {
         detectedPlate = ""
         pickupLocation = null
+        pickupAddress = ""
         destinationLocation = null
+        selectedDestinationInfo = null
         routeDistanceMeters = null
         routeDurationSeconds = null
         calculatedFare = null
+
+        pickupAcquiredAtEpochMs = null
+        destinationConfirmedAtEpochMs = null
+        fareComputationStartEpochMs = null
+        fareComputationStartElapsedMs = null
+        fareDisplayedAtEpochMs = null
+        fareComputationLatencyMs = null
+
         tripId = ""
         qrPayload = ""
         firebaseError = ""
         completionTimestamp = ""
     }
 
+    LaunchedEffect(Unit) {
+        kotlinx.coroutines.delay(650)
+
+        val user = geoFareFirebaseAuth.currentUser
+
+        if (user != null && !user.isAnonymous) {
+            currentScreen = "HOME"
+        } else {
+            if (user != null && user.isAnonymous) {
+                geoFareFirebaseAuth.signOut()
+            }
+            currentScreen = "LOGIN"
+        }
+    }
+
     when (currentScreen) {
 
-        "HOME" -> {
-            GeoFareHomeScreen(
-                onStartTrip = {
-                    resetTrip()
-                    currentScreen = "START_TRIP"
-                },
-                onTripHistory = {
-                    currentScreen = "TRIP_HISTORY"
-                },
-                onNotifications = {
-                    currentScreen = "NOTIFICATIONS"
-                },
-                onProfile = {
-                    currentScreen = "PROFILE"
-                },
-                onMore = {
-                    currentScreen = "MORE"
+        "SPLASH" -> {
+            SplashScreen(
+                onContinue = {
+                    currentScreen =
+                        if (hasAuthenticatedGeoFareUser()) {
+                            "HOME"
+                        } else {
+                            "LOGIN"
+                        }
                 }
             )
+        }
+
+        "LOGIN" -> {
+            LoginScreen(
+                onBack = {
+                    currentScreen = "SPLASH"
+                },
+                onCreateAccount = {
+                    currentScreen = "SIGN_UP"
+                },
+                onSignedIn = {
+                    currentScreen = "HOME"
+                }
+            )
+        }
+
+        "SIGN_UP" -> {
+            SignUpScreen(
+                onBack = {
+                    currentScreen = "LOGIN"
+                },
+                onSignIn = {
+                    currentScreen = "LOGIN"
+                },
+                onSignedUp = {
+                    currentScreen = "HOME"
+                }
+            )
+        }
+
+        "HOME" -> {
+            if (!hasAuthenticatedGeoFareUser()) {
+                currentScreen = "LOGIN"
+            } else {
+                GeoFareHomeScreen(
+                    onHome = { currentScreen = "HOME" },
+                    onStartTrip = {
+                        resetTrip()
+                        currentScreen = "START_TRIP"
+                    },
+                    onTripHistory = {
+                        currentScreen = "TRIP_HISTORY"
+                    },
+                    onNotifications = {
+                        currentScreen = "NOTIFICATIONS"
+                    },
+                    onSettings = {
+                        settingsReturnScreen = "HOME"
+                        currentScreen = "SETTINGS"
+                    },
+                    onProfile = {
+                        currentScreen = "PROFILE"
+                    },
+                    onMore = {
+                        currentScreen = "MORE"
+                    }
+                )
+            }
         }
 
         "START_TRIP" -> {
@@ -728,17 +1091,41 @@ fun GeoFareApp() {
                 onBack = { currentScreen = "START_TRIP" },
                 onContinue = { plate ->
                     detectedPlate = plate
-                    currentScreen = "LOCATION"
+
+                    // Start the study's end-to-end fare-computation workflow
+                    // at the moment the passenger confirms the plate.
+                    fareComputationStartEpochMs =
+                        System.currentTimeMillis()
+
+                    fareComputationStartElapsedMs =
+                        SystemClock.elapsedRealtime()
+
+                    fareDisplayedAtEpochMs = null
+                    fareComputationLatencyMs = null
+
+                    currentScreen = "ACQUIRING_LOCATION"
                 }
             )
         }
 
-        "LOCATION" -> {
-            LocationScreen(
-                onBack = { currentScreen = "PLATE_CAPTURE" },
-                onLocationConfirmed = { location ->
+        "ACQUIRING_LOCATION" -> {
+            AutomaticPickupLocationScreen(
+                onBack = {
+                    currentScreen = "PLATE_CAPTURE"
+                },
+                onLocationAcquired = { location ->
                     pickupLocation = location
+                    pickupAcquiredAtEpochMs = System.currentTimeMillis()
+
+                    // Continue immediately after obtaining GPS.
+                    // Reverse geocoding runs in the background only
+                    // to keep an internal pickup address.
+                    pickupAddress = "Current Location"
+
                     currentScreen = "DESTINATION"
+                },
+                onPickupAddressResolved = { resolvedAddress ->
+                    pickupAddress = resolvedAddress
                 }
             )
         }
@@ -747,12 +1134,34 @@ fun GeoFareApp() {
             DestinationScreen(
                 pickupLatitude = pickupLocation?.latitude ?: 0.0,
                 pickupLongitude = pickupLocation?.longitude ?: 0.0,
-                onBack = { currentScreen = "LOCATION" },
-                onRouteCalculated = { destination, distance, duration ->
+                pickupAddress = pickupAddress,
+                onBack = {
+                    currentScreen = "PLATE_CAPTURE"
+                },
+                onDestinationSelected = {
+                    destinationConfirmedAtEpochMs =
+                        System.currentTimeMillis()
+                },
+                onRouteCalculated = {
+                        destination,
+                        distance,
+                        duration,
+                        destinationInfo ->
+
                     destinationLocation = destination
+                    selectedDestinationInfo = destinationInfo
                     routeDistanceMeters = distance
                     routeDurationSeconds = duration
-                    calculatedFare = calculateFare(distance, DEMO_FARE_RULE)
+
+                    // Preserve the existing fare calculation logic.
+                    // The current source still uses DEMO_FARE_RULE until
+                    // the official Agoo fare configuration is supplied.
+                    calculatedFare =
+                        calculateFare(
+                            distance,
+                            DEMO_FARE_RULE
+                        )
+
                     currentScreen = "FARE"
                 }
             )
@@ -760,48 +1169,128 @@ fun GeoFareApp() {
 
         "FARE" -> {
             FareEstimateScreen(
+                pickupAddress = pickupAddress.ifBlank {
+                    "Current Location"
+                },
+                destinationInfo = selectedDestinationInfo,
                 distanceMeters = routeDistanceMeters ?: 0.0,
                 durationSeconds = routeDurationSeconds ?: 0.0,
                 fare = calculatedFare ?: 0.0,
-                onBack = { currentScreen = "DESTINATION" },
+                onFareDisplayed = {
+                    if (fareDisplayedAtEpochMs == null) {
+                        val displayedAt =
+                            System.currentTimeMillis()
+
+                        fareDisplayedAtEpochMs =
+                            displayedAt
+
+                        val startElapsed =
+                            fareComputationStartElapsedMs
+
+                        fareComputationLatencyMs =
+                            startElapsed?.let {
+                                (
+                                        SystemClock.elapsedRealtime() -
+                                                it
+                                        ).coerceAtLeast(0L)
+                            }
+
+                        Log.d(
+                            "GeoFareFareLatency",
+                            "Fare displayed. latencyMs=$fareComputationLatencyMs"
+                        )
+                    }
+                },
+                onBack = {
+                    currentScreen = "DESTINATION"
+                },
                 onConfirmFare = {
-                    tripId = "GF-" + UUID.randomUUID().toString().take(8).uppercase()
+                    tripId =
+                        "GF-" +
+                                UUID.randomUUID()
+                                    .toString()
+                                    .take(8)
+                                    .uppercase()
 
-                    val timestamp = SimpleDateFormat(
-                        "yyyy-MM-dd HH:mm:ss",
-                        Locale.US
-                    ).format(Date())
+                    val timestamp =
+                        SimpleDateFormat(
+                            "yyyy-MM-dd HH:mm:ss",
+                            Locale.US
+                        ).format(Date())
 
-                    qrPayload = buildWebsiteTripUrl(
-                        tripId = tripId,
-                        plate = detectedPlate,
-                        pickup = pickupLocation,
-                        destination = destinationLocation,
-                        distanceMeters = routeDistanceMeters ?: 0.0,
-                        fare = calculatedFare ?: 0.0,
-                        timestamp = timestamp
-                    )
+                    // If the user confirms extremely quickly, make sure
+                    // the measurement still has a valid end timestamp.
+                    if (fareDisplayedAtEpochMs == null) {
+                        fareDisplayedAtEpochMs =
+                            System.currentTimeMillis()
+
+                        fareComputationLatencyMs =
+                            fareComputationStartElapsedMs?.let {
+                                (
+                                        SystemClock.elapsedRealtime() -
+                                                it
+                                        ).coerceAtLeast(0L)
+                            }
+                    }
+
+                    qrPayload =
+                        buildWebsiteTripUrl(
+                            tripId = tripId,
+                            plate = detectedPlate,
+                            pickup = pickupLocation,
+                            destination = destinationLocation,
+                            distanceMeters =
+                                routeDistanceMeters ?: 0.0,
+                            fare = calculatedFare ?: 0.0,
+                            timestamp = timestamp
+                        )
 
                     saveTripToFirestore(
                         tripId = tripId,
                         plate = detectedPlate,
                         pickup = pickupLocation,
+                        pickupAddress = pickupAddress,
                         destination = destinationLocation,
-                        distanceMeters = routeDistanceMeters ?: 0.0,
+                        destinationAddress =
+                            selectedDestinationInfo?.let { info ->
+                                listOfNotNull(
+                                    info.barangayLabel(),
+                                    info.municipalityProvinceLabel()
+                                        .takeIf {
+                                            it !=
+                                                    "Location details unavailable"
+                                        }
+                                ).joinToString(", ")
+                            } ?: "Selected Destination",
+                        distanceMeters =
+                            routeDistanceMeters ?: 0.0,
                         fare = calculatedFare ?: 0.0,
                         timestamp = timestamp,
+                        pickupAcquiredAtEpochMs =
+                            pickupAcquiredAtEpochMs,
+                        destinationConfirmedAtEpochMs =
+                            destinationConfirmedAtEpochMs,
+                        fareComputationStartEpochMs =
+                            fareComputationStartEpochMs,
+                        fareDisplayedAtEpochMs =
+                            fareDisplayedAtEpochMs,
+                        fareComputationLatencyMs =
+                            fareComputationLatencyMs,
                         onSuccess = {
                             firebaseError = ""
                             currentScreen = "QR"
                         },
                         onFailure = { exception ->
-                            firebaseError = exception.message
-                                ?: "Unable to save trip to Firebase."
+                            firebaseError =
+                                exception.message
+                                    ?: "Unable to save trip to Firebase."
+
                             Log.e(
                                 "GeoFareFirebase",
                                 "Initial trip save failed",
                                 exception
                             )
+
                             currentScreen = "QR"
                         }
                     )
@@ -834,10 +1323,12 @@ fun GeoFareApp() {
                 pickupLocation = pickupLocation,
                 destinationLocation = destinationLocation,
                 onEndTrip = {
-                    completionTimestamp = SimpleDateFormat(
-                        "yyyy-MM-dd HH:mm:ss",
-                        Locale.US
-                    ).format(Date())
+                    completionTimestamp =
+                        SimpleDateFormat(
+                            "yyyy-MM-dd HH:mm:ss",
+                            Locale.US
+                        ).format(Date())
+
                     currentScreen = "TRIP_COMPLETED"
                 }
             )
@@ -846,25 +1337,50 @@ fun GeoFareApp() {
         "TRIP_COMPLETED" -> {
             TripCompletedScreen(
                 tripId = tripId,
-                plate = detectedPlate.ifBlank { "UNKNOWN" },
-                distanceMeters = routeDistanceMeters ?: 0.0,
-                durationSeconds = routeDurationSeconds ?: 0.0,
-                fare = calculatedFare ?: 0.0,
-                pickupLocation = pickupLocation,
-                destinationLocation = destinationLocation,
+                plate = detectedPlate.ifBlank {
+                    "UNKNOWN"
+                },
+                distanceMeters =
+                    routeDistanceMeters ?: 0.0,
+                durationSeconds =
+                    routeDurationSeconds ?: 0.0,
+                fare =
+                    calculatedFare ?: 0.0,
+                pickupAddress =
+                    pickupAddress.ifBlank { "Current Location" },
+                destinationAddress =
+                    selectedDestinationInfo?.let { info ->
+                        listOfNotNull(
+                            info.barangayLabel(),
+                            info.municipalityProvinceLabel()
+                                .takeIf {
+                                    it !=
+                                            "Location details unavailable"
+                                }
+                        ).joinToString(", ")
+                    } ?: "Selected Destination",
                 completedAt = completionTimestamp,
-                onReportProblem = { currentScreen = "REPORT_ISSUE" },
-                onDone = { currentScreen = "HOME" }
+                onReportProblem = {
+                    currentScreen = "REPORT_ISSUE"
+                },
+                onDone = {
+                    currentScreen = "HOME"
+                }
             )
         }
 
         "REPORT_ISSUE" -> {
             PassengerReportScreen(
                 tripId = tripId,
-                plate = detectedPlate.ifBlank { "UNKNOWN" },
-                distanceKm = (routeDistanceMeters ?: 0.0) / 1000.0,
+                plate = detectedPlate.ifBlank {
+                    "UNKNOWN"
+                },
+                distanceKm =
+                    (routeDistanceMeters ?: 0.0) / 1000.0,
                 fare = calculatedFare ?: 0.0,
-                onCancel = { currentScreen = "TRIP_COMPLETED" },
+                onCancel = {
+                    currentScreen = "TRIP_COMPLETED"
+                },
                 onSubmitted = {
                     currentScreen = "REPORT_SUBMITTED"
                 }
@@ -873,83 +1389,132 @@ fun GeoFareApp() {
 
         "REPORT_SUBMITTED" -> {
             ReportSubmittedScreen(
-                onDone = { currentScreen = "HOME" },
-                onViewHistory = { currentScreen = "TRIP_HISTORY" }
+                onDone = {
+                    currentScreen = "HOME"
+                },
+                onViewHistory = {
+                    currentScreen = "TRIP_HISTORY"
+                }
             )
         }
 
         "PROFILE" -> {
             ProfileScreen(
                 onBack = { currentScreen = "HOME" },
-                onEditProfile = { currentScreen = "EDIT_PROFILE" },
-                onSettings = { currentScreen = "SETTINGS" },
-                onTripHistory = { currentScreen = "TRIP_HISTORY" }
+                onEditProfile = {
+                    currentScreen = "EDIT_PROFILE"
+                },
+                onSettings = {
+                    settingsReturnScreen = "PROFILE"
+                    currentScreen = "SETTINGS"
+                },
+                onTripHistory = {
+                    currentScreen = "TRIP_HISTORY"
+                },
+                onLogout = {
+                    geoFareFirebaseAuth.signOut()
+                    currentScreen = "LOGIN"
+                }
             )
         }
 
         "EDIT_PROFILE" -> {
             EditProfileScreen(
-                onBack = { currentScreen = "PROFILE" }
+                onBack = { currentScreen = "PROFILE" },
+                onSaved = { currentScreen = "PROFILE" }
             )
         }
 
         "SETTINGS" -> {
             SettingsScreen(
-                onBack = { currentScreen = "PROFILE" },
-                onNotifications = { currentScreen = "NOTIFICATIONS" },
-                onHelp = { currentScreen = "HELP" },
-                onAbout = { currentScreen = "ABOUT" }
+                onBack = {
+                    currentScreen = settingsReturnScreen
+                },
+                onEditProfile = {
+                    currentScreen = "EDIT_PROFILE"
+                },
+                onNotifications = {
+                    currentScreen = "NOTIFICATIONS"
+                },
+                onHelp = {
+                    currentScreen = "HELP"
+                },
+                onAbout = {
+                    currentScreen = "ABOUT"
+                },
+                onOpenLocationSettings = {
+                    currentScreen = "SETTINGS_LOCATION"
+                },
+                onLogout = {
+                    geoFareFirebaseAuth.signOut()
+                    currentScreen = "LOGIN"
+                }
+            )
+        }
+
+        "SETTINGS_LOCATION" -> {
+            LocationSettingsInfoScreen(
+                onBack = {
+                    currentScreen = "SETTINGS"
+                }
             )
         }
 
         "NOTIFICATIONS" -> {
             NotificationsScreen(
-                onBack = { currentScreen = "HOME" }
+                onBack = {
+                    currentScreen = "HOME"
+                }
             )
         }
 
         "HELP" -> {
             HelpSupportScreen(
-                onBack = { currentScreen = "SETTINGS" }
+                onBack = {
+                    currentScreen = "SETTINGS"
+                }
             )
         }
 
         "ABOUT" -> {
             AboutScreen(
-                onBack = { currentScreen = "SETTINGS" }
+                onBack = {
+                    currentScreen = "SETTINGS"
+                }
             )
         }
 
         "MORE" -> {
             MoreScreen(
-                onClose = { currentScreen = "HOME" },
-                onHome = { currentScreen = "HOME" },
-                onTrips = { currentScreen = "TRIP_HISTORY" },
-                onProfile = { currentScreen = "PROFILE" },
-                onSettings = { currentScreen = "SETTINGS" },
-                onHelp = { currentScreen = "HELP" },
-                onAbout = { currentScreen = "ABOUT" },
-                onNotifications = { currentScreen = "NOTIFICATIONS" }
-            )
-        }
-
-        /* Visual-only account screens for the design system.
-           No authentication behavior is connected in this phase. */
-        "SPLASH" -> {
-            SplashScreen(onContinue = { currentScreen = "HOME" })
-        }
-
-        "LOGIN" -> {
-            LoginScreen(
-                onBack = { currentScreen = "HOME" },
-                onCreateAccount = { currentScreen = "SIGN_UP" }
-            )
-        }
-
-        "SIGN_UP" -> {
-            SignUpScreen(
-                onBack = { currentScreen = "HOME" },
-                onSignIn = { currentScreen = "LOGIN" }
+                onClose = {
+                    currentScreen = "HOME"
+                },
+                onHome = {
+                    currentScreen = "HOME"
+                },
+                onTrips = {
+                    currentScreen = "TRIP_HISTORY"
+                },
+                onProfile = {
+                    currentScreen = "PROFILE"
+                },
+                onSettings = {
+                    settingsReturnScreen = "MORE"
+                    currentScreen = "SETTINGS"
+                },
+                onHelp = {
+                    currentScreen = "HELP"
+                },
+                onAbout = {
+                    currentScreen = "ABOUT"
+                },
+                onNotifications = {
+                    currentScreen = "NOTIFICATIONS"
+                },
+                onLogout = {
+                    geoFareFirebaseAuth.signOut()
+                    currentScreen = "LOGIN"
+                }
             )
         }
     }
@@ -958,7 +1523,6 @@ fun GeoFareApp() {
 
 /* =========================================================
    PROFILE / SETTINGS / SUPPORT / ABOUT / DRAWER UI
-   Visual-only design screens for the UI phase.
    ========================================================= */
 
 @Composable
@@ -966,8 +1530,44 @@ fun ProfileScreen(
     onBack: () -> Unit,
     onEditProfile: () -> Unit,
     onSettings: () -> Unit,
-    onTripHistory: () -> Unit
+    onTripHistory: () -> Unit,
+    onLogout: () -> Unit
 ) {
+    var profile by remember {
+        mutableStateOf(
+            GeoFareUserProfile(
+                fullName = "GeoFare Passenger",
+                email = geoFareFirebaseAuth.currentUser?.email.orEmpty(),
+                phoneNumber = geoFareFirebaseAuth.currentUser?.phoneNumber.orEmpty()
+            )
+        )
+    }
+
+    var isLoading by remember { mutableStateOf(true) }
+    var errorText by remember { mutableStateOf("") }
+
+    LaunchedEffect(Unit) {
+        val user = geoFareFirebaseAuth.currentUser
+
+        if (user == null || user.isAnonymous) {
+            isLoading = false
+            errorText = "Please sign in again."
+            return@LaunchedEffect
+        }
+
+        loadGeoFareUserProfile(
+            user = user,
+            onSuccess = {
+                profile = it
+                isLoading = false
+            },
+            onFailure = {
+                isLoading = false
+                errorText = it.message ?: "Unable to load your profile."
+            }
+        )
+    }
+
     Box(
         Modifier
             .fillMaxSize()
@@ -984,79 +1584,133 @@ fun ProfileScreen(
 
             Spacer(Modifier.height(14.dp))
 
-            Box(
-                Modifier
-                    .fillMaxWidth()
-                    .background(Color.White, RoundedCornerShape(24.dp))
-                    .padding(18.dp)
-            ) {
-                Column {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(
-                            Modifier
-                                .size(72.dp)
-                                .background(Color(0xFF78A7D2), RoundedCornerShape(36.dp)),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Text("●", fontSize = 28.sp, color = Color.White)
-                        }
-                        Spacer(Modifier.width(14.dp))
-                        Column(Modifier.weight(1f)) {
-                            Text("GeoFare Passenger", fontSize = 19.sp, fontWeight = FontWeight.ExtraBold, color = Color(0xFF14324A))
-                            Text("Passenger account", fontSize = 12.sp, color = Color(0xFF71879B))
-                        }
-                        TextButton(onClick = onEditProfile) {
-                            Text("Edit", color = Color(0xFF1476C9), fontWeight = FontWeight.Bold)
-                        }
-                    }
+            if (isLoading) {
+                Box(
+                    Modifier.fillMaxWidth().padding(28.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    CircularProgressIndicator(color = Color(0xFF1476C9))
+                }
+            } else {
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .background(Color.White, RoundedCornerShape(24.dp))
+                        .padding(18.dp)
+                ) {
+                    Column {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(
+                                Modifier
+                                    .size(72.dp)
+                                    .background(
+                                        Color(0xFF78A7D2),
+                                        RoundedCornerShape(36.dp)
+                                    ),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = profile.fullName
+                                        .trim()
+                                        .firstOrNull()
+                                        ?.uppercase()
+                                        ?: "G",
+                                    fontSize = 28.sp,
+                                    fontWeight = FontWeight.ExtraBold,
+                                    color = Color.White
+                                )
+                            }
 
-                    Spacer(Modifier.height(18.dp))
+                            Spacer(Modifier.width(14.dp))
 
-                    Row(Modifier.fillMaxWidth()) {
-                        GeoFareStat(
-                            "—",
-                            "Total Trips",
-                            Modifier.weight(1f)
-                        )
-                        GeoFareStat(
-                            "—",
-                            "Total Fare",
-                            Modifier.weight(1f)
-                        )
-                        GeoFareStat(
-                            "—",
-                            "This Month",
-                            Modifier.weight(1f)
-                        )
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    profile.fullName.ifBlank { "GeoFare Passenger" },
+                                    fontSize = 19.sp,
+                                    fontWeight = FontWeight.ExtraBold,
+                                    color = Color(0xFF14324A)
+                                )
+                                Text(
+                                    profile.email.ifBlank { "No email on account" },
+                                    fontSize = 12.sp,
+                                    color = Color(0xFF71879B)
+                                )
+                                if (profile.phoneNumber.isNotBlank()) {
+                                    Text(
+                                        profile.phoneNumber,
+                                        fontSize = 12.sp,
+                                        color = Color(0xFF71879B)
+                                    )
+                                }
+                            }
+
+                            TextButton(onClick = onEditProfile) {
+                                Text(
+                                    "Edit",
+                                    color = Color(0xFF1476C9),
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+
+                        Spacer(Modifier.height(18.dp))
+
+                        Row(Modifier.fillMaxWidth()) {
+                            GeoFareStat(
+                                "✓",
+                                "Account",
+                                Modifier.weight(1f)
+                            )
+                            GeoFareStat(
+                                "GPS",
+                                "Trip tracking",
+                                Modifier.weight(1f)
+                            )
+                            GeoFareStat(
+                                "QR",
+                                "Driver confirmation",
+                                Modifier.weight(1f)
+                            )
+                        }
                     }
                 }
+
+                Spacer(Modifier.height(14.dp))
+
+                GeoFareMenuCard(
+                    title = "My Trips",
+                    subtitle = "Review your completed trips",
+                    icon = "◷",
+                    onClick = onTripHistory
+                )
+
+                GeoFareMenuCard(
+                    title = "Settings",
+                    subtitle = "App preferences and account controls",
+                    icon = "⚙",
+                    onClick = onSettings
+                )
+
+                GeoFareMenuCard(
+                    title = "Sign Out",
+                    subtitle = "Sign out of this GeoFare account",
+                    icon = "⇥",
+                    onClick = onLogout
+                )
             }
 
-            Spacer(Modifier.height(14.dp))
-
-            GeoFareMenuCard(
-                title = "My Trips",
-                subtitle = "Review your completed trips",
-                icon = "◷",
-                onClick = onTripHistory
-            )
-
-            GeoFareMenuCard(
-                title = "Settings",
-                subtitle = "App preferences and privacy",
-                icon = "⚙",
-                onClick = onSettings
-            )
-
-            GeoFareMenuCard(
-                title = "Help & Support",
-                subtitle = "Get help using GeoFare",
-                icon = "?",
-                onClick = onSettings
-            )
+            if (errorText.isNotBlank()) {
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    errorText,
+                    color = Color(0xFFB3261E),
+                    fontSize = 12.sp
+                )
+            }
         }
     }
 }
+
 
 @Composable
 fun GeoFareStat(
@@ -1084,6 +1738,7 @@ fun GeoFareStat(
     }
 }
 
+
 @Composable
 fun GeoFareMenuCard(
     title: String,
@@ -1110,25 +1765,86 @@ fun GeoFareMenuCard(
             Box(
                 Modifier
                     .size(42.dp)
-                    .background(Color(0xFFEAF5FF), RoundedCornerShape(13.dp)),
+                    .background(
+                        Color(0xFFEAF5FF),
+                        RoundedCornerShape(13.dp)
+                    ),
                 contentAlignment = Alignment.Center
             ) {
-                Text(icon, fontSize = 20.sp, color = Color(0xFF0B4F8C))
+                Text(
+                    icon,
+                    fontSize = 20.sp,
+                    color = Color(0xFF0B4F8C)
+                )
             }
+
             Spacer(Modifier.width(12.dp))
+
             Column(Modifier.weight(1f)) {
-                Text(title, fontSize = 14.sp, fontWeight = FontWeight.Bold)
-                Text(subtitle, fontSize = 11.sp, color = Color(0xFF71879B))
+                Text(
+                    title,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    subtitle,
+                    fontSize = 11.sp,
+                    color = Color(0xFF71879B)
+                )
             }
-            Text("›", fontSize = 24.sp, color = Color(0xFF7D92A4))
+
+            Text(
+                "›",
+                fontSize = 24.sp,
+                color = Color(0xFF7D92A4)
+            )
         }
     }
 }
 
+
 @Composable
 fun EditProfileScreen(
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    onSaved: () -> Unit
 ) {
+    val user = geoFareFirebaseAuth.currentUser
+
+    var fullName by remember {
+        mutableStateOf(user?.displayName.orEmpty())
+    }
+    var phoneNumber by remember {
+        mutableStateOf(user?.phoneNumber.orEmpty())
+    }
+    var email by remember {
+        mutableStateOf(user?.email.orEmpty())
+    }
+
+    var loadedProfile by remember { mutableStateOf(false) }
+    var isSaving by remember { mutableStateOf(false) }
+    var errorText by remember { mutableStateOf("") }
+
+    LaunchedEffect(Unit) {
+        if (user == null || user.isAnonymous) {
+            errorText = "Please sign in again."
+            return@LaunchedEffect
+        }
+
+        loadGeoFareUserProfile(
+            user = user,
+            onSuccess = {
+                fullName = it.fullName
+                phoneNumber = it.phoneNumber
+                email = it.email
+                loadedProfile = true
+            },
+            onFailure = {
+                loadedProfile = true
+                errorText = it.message ?: "Unable to load your profile."
+            }
+        )
+    }
+
     Box(
         Modifier
             .fillMaxSize()
@@ -1152,41 +1868,167 @@ fun EditProfileScreen(
             ) {
                 Column {
                     OutlinedTextField(
-                        value = "",
-                        onValueChange = {},
+                        value = fullName,
+                        onValueChange = {
+                            fullName = it
+                            errorText = ""
+                        },
                         modifier = Modifier.fillMaxWidth(),
-                        label = { Text("Name") },
-                        placeholder = { Text("Passenger name") },
-                        enabled = false
+                        label = { Text("Full name") },
+                        singleLine = true
                     )
+
                     Spacer(Modifier.height(12.dp))
+
                     OutlinedTextField(
-                        value = "",
+                        value = email,
                         onValueChange = {},
                         modifier = Modifier.fillMaxWidth(),
                         label = { Text("Email") },
-                        placeholder = { Text("Email address") },
+                        singleLine = true,
                         enabled = false
                     )
-                    Spacer(Modifier.height(14.dp))
-                    Text(
-                        "Profile editing will be connected later.",
-                        fontSize = 12.sp,
-                        color = Color(0xFF71879B)
+
+                    Spacer(Modifier.height(12.dp))
+
+                    OutlinedTextField(
+                        value = phoneNumber,
+                        onValueChange = {
+                            phoneNumber = it
+                            errorText = ""
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("Phone number") },
+                        singleLine = true
                     )
+
+                    Spacer(Modifier.height(14.dp))
+
+                    if (errorText.isNotBlank()) {
+                        Text(
+                            errorText,
+                            color = Color(0xFFB3261E),
+                            fontSize = 12.sp
+                        )
+                        Spacer(Modifier.height(10.dp))
+                    }
+
+                    Button(
+                        onClick = {
+                            val cleanName = fullName.trim()
+
+                            if (cleanName.length < 2) {
+                                errorText = "Enter your full name."
+                                return@Button
+                            }
+
+                            if (
+                                phoneNumber.isNotBlank() &&
+                                !isValidPhoneNumber(phoneNumber)
+                            ) {
+                                errorText = "Enter a valid phone number."
+                                return@Button
+                            }
+
+                            val currentUser = geoFareFirebaseAuth.currentUser
+
+                            if (currentUser == null || currentUser.isAnonymous) {
+                                errorText = "Your session has expired. Please sign in again."
+                                return@Button
+                            }
+
+                            isSaving = true
+                            errorText = ""
+
+                            updateGeoFareDisplayName(
+                                user = currentUser,
+                                fullName = cleanName,
+                                onSuccess = {
+                                    saveGeoFareUserProfile(
+                                        user = currentUser,
+                                        fullName = cleanName,
+                                        phoneNumber = normalizePhoneNumber(phoneNumber),
+                                        onSuccess = {
+                                            isSaving = false
+                                            onSaved()
+                                        },
+                                        onFailure = { exception ->
+                                            isSaving = false
+                                            errorText =
+                                                exception.message
+                                                    ?: "Unable to save your profile."
+                                        }
+                                    )
+                                },
+                                onFailure = { exception ->
+                                    isSaving = false
+                                    errorText =
+                                        exception.message
+                                            ?: "Unable to update your profile."
+                                }
+                            )
+                        },
+                        enabled = !isSaving && loadedProfile,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(54.dp),
+                        shape = RoundedCornerShape(16.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFF1476C9)
+                        )
+                    ) {
+                        if (isSaving) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(20.dp),
+                                strokeWidth = 2.dp,
+                                color = Color.White
+                            )
+                        } else {
+                            Text(
+                                "SAVE CHANGES",
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
                 }
             }
         }
     }
 }
 
+
 @Composable
 fun SettingsScreen(
     onBack: () -> Unit,
+    onEditProfile: () -> Unit,
     onNotifications: () -> Unit,
     onHelp: () -> Unit,
-    onAbout: () -> Unit
+    onAbout: () -> Unit,
+    onOpenLocationSettings: () -> Unit,
+    onLogout: () -> Unit
 ) {
+    var darkMode by remember { mutableStateOf(false) }
+
+    var showLanguageDialog by remember { mutableStateOf(false) }
+    if (showLanguageDialog) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { showLanguageDialog = false },
+            title = { Text("Language") },
+            text = {
+                Text(
+                    "English is currently the available app language."
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = { showLanguageDialog = false }
+                ) {
+                    Text("OK")
+                }
+            }
+        )
+    }
+
     Box(
         Modifier
             .fillMaxSize()
@@ -1203,24 +2045,131 @@ fun SettingsScreen(
             Spacer(Modifier.height(12.dp))
 
             GeoFareSectionLabel("Account")
-            GeoFareMenuCard("Personal Information", "Passenger profile", "♙") {}
-            GeoFareMenuCard("Notification Settings", "Manage alerts", "◉", onNotifications)
+
+            GeoFareMenuCard(
+                "Personal Information",
+                "Update passenger profile",
+                "♙",
+                onEditProfile
+            )
+
+            GeoFareMenuCard(
+                "Notification Settings",
+                "Manage trip alerts",
+                "◉",
+                onNotifications
+            )
 
             Spacer(Modifier.height(8.dp))
 
             GeoFareSectionLabel("App Preferences")
-            GeoFareMenuCard("Language", "English", "◎") {}
-            GeoFareMenuCard("Location Services", "GPS-based trip monitoring", "⌖") {}
-            GeoFareMenuCard("Dark Mode", "Not connected in this UI phase", "◐") {}
+
+            GeoFareMenuCard(
+                "Language",
+                "English",
+                "◎",
+                onClick = { showLanguageDialog = true }
+            )
+
+            GeoFareMenuCard(
+                "Location Services",
+                "Open device GPS settings",
+                "⌖",
+                onOpenLocationSettings
+            )
+
+            Button(
+                onClick = {
+                    darkMode = !darkMode
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 5.dp)
+                    .height(70.dp),
+                shape = RoundedCornerShape(18.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color.White,
+                    contentColor = Color(0xFF14324A)
+                )
+            ) {
+                Row(
+                    Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        Modifier
+                            .size(42.dp)
+                            .background(
+                                Color(0xFFEAF5FF),
+                                RoundedCornerShape(13.dp)
+                            ),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            "◐",
+                            fontSize = 20.sp,
+                            color = Color(0xFF0B4F8C)
+                        )
+                    }
+
+                    Spacer(Modifier.width(12.dp))
+
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            "Dark Mode",
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            if (darkMode) {
+                                "Enabled for this screen"
+                            } else {
+                                "Tap to enable"
+                            },
+                            fontSize = 11.sp,
+                            color = Color(0xFF71879B)
+                        )
+                    }
+
+                    Text(
+                        if (darkMode) "ON" else "OFF",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = if (darkMode) Color(0xFF1476C9) else Color(0xFF71879B)
+                    )
+                }
+            }
 
             Spacer(Modifier.height(8.dp))
 
             GeoFareSectionLabel("About")
-            GeoFareMenuCard("Help & Support", "FAQs and guidance", "?", onHelp)
-            GeoFareMenuCard("App Information", "GeoFare v1.0", "ⓘ", onAbout)
+
+            GeoFareMenuCard(
+                "Help & Support",
+                "FAQs and guidance",
+                "?",
+                onHelp
+            )
+
+            GeoFareMenuCard(
+                "App Information",
+                "GeoFare v1.0",
+                "ⓘ",
+                onAbout
+            )
+
+            Spacer(Modifier.height(8.dp))
+
+            GeoFareMenuCard(
+                "Sign Out",
+                "Sign out of this GeoFare account",
+                "⇥",
+                onLogout
+            )
         }
     }
 }
+
 
 @Composable
 fun GeoFareSectionLabel(text: String) {
@@ -1232,6 +2181,7 @@ fun GeoFareSectionLabel(text: String) {
         modifier = Modifier.padding(horizontal = 4.dp, vertical = 6.dp)
     )
 }
+
 
 @Composable
 fun NotificationsScreen(
@@ -1245,16 +2195,37 @@ fun NotificationsScreen(
     ) {
         Column(Modifier.fillMaxSize()) {
             GeoFareSimpleTopBar("Notifications", onBack)
+
             Spacer(Modifier.height(12.dp))
-            GeoFareNotificationCard("Trip confirmed", "Your driver has confirmed the trip.", "Today")
-            GeoFareNotificationCard("Trip completed", "Your recent trip was saved to Trip History.", "Today")
-            GeoFareNotificationCard("GeoFare tip", "Keep the tricycle plate centered in the guide frame.", "Earlier")
+
+            GeoFareNotificationCard(
+                "Trip confirmed",
+                "Your driver has confirmed the trip.",
+                "Today"
+            )
+
+            GeoFareNotificationCard(
+                "Trip completed",
+                "Your recent trip was saved to Trip History.",
+                "Today"
+            )
+
+            GeoFareNotificationCard(
+                "GeoFare tip",
+                "Keep the tricycle plate centered in the guide frame.",
+                "Earlier"
+            )
         }
     }
 }
 
+
 @Composable
-fun GeoFareNotificationCard(title: String, message: String, time: String) {
+fun GeoFareNotificationCard(
+    title: String,
+    message: String,
+    time: String
+) {
     Box(
         Modifier
             .fillMaxWidth()
@@ -1266,22 +2237,46 @@ fun GeoFareNotificationCard(title: String, message: String, time: String) {
             Box(
                 Modifier
                     .size(40.dp)
-                    .background(Color(0xFFEAF5FF), RoundedCornerShape(13.dp)),
+                    .background(
+                        Color(0xFFEAF5FF),
+                        RoundedCornerShape(13.dp)
+                    ),
                 contentAlignment = Alignment.Center
             ) {
-                Text("•", fontSize = 24.sp, color = Color(0xFF1476C9))
+                Text(
+                    "•",
+                    fontSize = 24.sp,
+                    color = Color(0xFF1476C9)
+                )
             }
+
             Spacer(Modifier.width(12.dp))
+
             Column(Modifier.weight(1f)) {
-                Text(title, fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color(0xFF14324A))
+                Text(
+                    title,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color(0xFF14324A)
+                )
                 Spacer(Modifier.height(3.dp))
-                Text(message, fontSize = 12.sp, color = Color(0xFF71879B), lineHeight = 18.sp)
+                Text(
+                    message,
+                    fontSize = 12.sp,
+                    color = Color(0xFF71879B),
+                    lineHeight = 18.sp
+                )
                 Spacer(Modifier.height(4.dp))
-                Text(time, fontSize = 10.sp, color = Color(0xFF98A9B8))
+                Text(
+                    time,
+                    fontSize = 10.sp,
+                    color = Color(0xFF98A9B8)
+                )
             }
         }
     }
 }
+
 
 @Composable
 fun HelpSupportScreen(
@@ -1299,16 +2294,25 @@ fun HelpSupportScreen(
                 .verticalScroll(rememberScrollState())
         ) {
             GeoFareSimpleTopBar("Help & Support", onBack)
+
             Spacer(Modifier.height(14.dp))
+
             GeoFareDetailCard(
                 "Frequently Asked Questions",
                 listOf(
-                    "How do I start a trip?" to "Start a Trip → capture plate → choose destination → review fare.",
-                    "How does the driver confirm?" to "The driver scans the QR with Google Lens and confirms the trip on the web page.",
-                    "Where can I see completed trips?" to "Open Trip History from the home screen."
+                    "How do I start a trip?" to
+                            "Start a Trip → capture plate → choose destination → review fare.",
+
+                    "How does the driver confirm?" to
+                            "The driver scans the QR with Google Lens and confirms the trip on the web page.",
+
+                    "Where can I see completed trips?" to
+                            "Open Trip History from the home screen."
                 )
             )
+
             Spacer(Modifier.height(12.dp))
+
             GeoFareDetailCard(
                 "Support",
                 listOf(
@@ -1319,6 +2323,83 @@ fun HelpSupportScreen(
         }
     }
 }
+
+
+@Composable
+fun LocationSettingsInfoScreen(
+    onBack: () -> Unit
+) {
+    val context = LocalContext.current
+
+    Box(
+        Modifier
+            .fillMaxSize()
+            .background(Color(0xFFF5FAFE))
+            .padding(16.dp)
+    ) {
+        Column(
+            Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+        ) {
+            GeoFareSimpleTopBar(
+                "Location Services",
+                onBack
+            )
+
+            Spacer(Modifier.height(14.dp))
+
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .background(Color.White, RoundedCornerShape(24.dp))
+                    .padding(18.dp)
+            ) {
+                Column {
+                    Text(
+                        "GPS is required for pickup and route monitoring.",
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFF14324A)
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "Enable Location services in Android Settings, then return to GeoFare.",
+                        fontSize = 13.sp,
+                        color = Color(0xFF71879B),
+                        lineHeight = 19.sp
+                    )
+                    Spacer(Modifier.height(16.dp))
+                    Button(
+                        onClick = {
+                            try {
+                                context.startActivity(
+                                    Intent(
+                                        android.provider.Settings.ACTION_LOCATION_SOURCE_SETTINGS
+                                    )
+                                )
+                            } catch (_: Exception) {
+                            }
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(52.dp),
+                        shape = RoundedCornerShape(16.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFF1476C9)
+                        )
+                    ) {
+                        Text(
+                            "OPEN ANDROID LOCATION SETTINGS",
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
 
 @Composable
 fun AboutScreen(
@@ -1336,35 +2417,63 @@ fun AboutScreen(
                 .verticalScroll(rememberScrollState())
         ) {
             GeoFareSimpleTopBar("About", onBack)
+
             Spacer(Modifier.height(20.dp))
+
             Box(
                 Modifier
                     .fillMaxWidth()
                     .background(Color.White, RoundedCornerShape(26.dp))
                     .padding(20.dp)
             ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
                     Box(
                         Modifier
                             .size(76.dp)
-                            .background(Color(0xFF0B4F8C), RoundedCornerShape(22.dp)),
+                            .background(
+                                Color(0xFF0B4F8C),
+                                RoundedCornerShape(22.dp)
+                            ),
                         contentAlignment = Alignment.Center
                     ) {
-                        Text("GF", color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.ExtraBold)
+                        Text(
+                            "GF",
+                            color = Color.White,
+                            fontSize = 24.sp,
+                            fontWeight = FontWeight.ExtraBold
+                        )
                     }
+
                     Spacer(Modifier.height(12.dp))
-                    Text("GeoFare", fontSize = 25.sp, fontWeight = FontWeight.ExtraBold, color = Color(0xFF0B4F8C))
-                    Text("Passenger App", fontSize = 12.sp, color = Color(0xFF71879B))
+
+                    Text(
+                        "GeoFare",
+                        fontSize = 25.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = Color(0xFF0B4F8C)
+                    )
+
+                    Text(
+                        "Passenger App",
+                        fontSize = 12.sp,
+                        color = Color(0xFF71879B)
+                    )
+
                     Spacer(Modifier.height(16.dp))
+
                     Text(
                         "GPS-Based Tricycle Fare & Trip Monitoring System",
                         fontSize = 14.sp,
                         textAlign = TextAlign.Center,
                         color = Color(0xFF14324A)
                     )
+
                     Spacer(Modifier.height(12.dp))
+
                     Text(
-                        "UI/UX design phase • v1.0",
+                        "Functional phase • v1.0",
                         fontSize = 11.sp,
                         color = Color(0xFF7B8FA1)
                     )
@@ -1373,6 +2482,7 @@ fun AboutScreen(
         }
     }
 }
+
 
 @Composable
 fun MoreScreen(
@@ -1383,7 +2493,8 @@ fun MoreScreen(
     onSettings: () -> Unit,
     onHelp: () -> Unit,
     onAbout: () -> Unit,
-    onNotifications: () -> Unit
+    onNotifications: () -> Unit,
+    onLogout: () -> Unit
 ) {
     Box(
         Modifier
@@ -1405,48 +2516,108 @@ fun MoreScreen(
                 Box(
                     Modifier
                         .size(52.dp)
-                        .background(Color(0xFF0B4F8C), RoundedCornerShape(17.dp)),
+                        .background(
+                            Color(0xFF0B4F8C),
+                            RoundedCornerShape(17.dp)
+                        ),
                     contentAlignment = Alignment.Center
                 ) {
-                    Text("GF", color = Color.White, fontWeight = FontWeight.ExtraBold, fontSize = 18.sp)
+                    Text(
+                        "GF",
+                        color = Color.White,
+                        fontWeight = FontWeight.ExtraBold,
+                        fontSize = 18.sp
+                    )
                 }
+
                 Spacer(Modifier.width(12.dp))
+
                 Column(Modifier.weight(1f)) {
-                    Text("GeoFare", fontSize = 20.sp, fontWeight = FontWeight.ExtraBold, color = Color(0xFF0B4F8C))
-                    Text("Passenger App", fontSize = 12.sp, color = Color(0xFF71879B))
+                    Text(
+                        "GeoFare",
+                        fontSize = 20.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = Color(0xFF0B4F8C)
+                    )
+                    Text(
+                        "Passenger App",
+                        fontSize = 12.sp,
+                        color = Color(0xFF71879B)
+                    )
                 }
+
                 TextButton(onClick = onClose) {
-                    Text("×", fontSize = 28.sp, color = Color(0xFF0B4F8C))
+                    Text(
+                        "×",
+                        fontSize = 28.sp,
+                        color = Color(0xFF0B4F8C)
+                    )
                 }
             }
 
             Spacer(Modifier.height(22.dp))
 
-            GeoFareMenuCard("Home", "Return to dashboard", "⌂", onHome)
-            GeoFareMenuCard("Trip History", "See completed trips", "◷", onTrips)
-            GeoFareMenuCard("Profile", "Passenger information", "♙", onProfile)
-            GeoFareMenuCard("Settings", "Preferences", "⚙", onSettings)
-            GeoFareMenuCard("Notifications", "Recent alerts", "◉", onNotifications)
-            GeoFareMenuCard("Help & Support", "Need assistance?", "?", onHelp)
-            GeoFareMenuCard("About GeoFare", "App information", "ⓘ", onAbout)
+            GeoFareMenuCard(
+                "Home",
+                "Return to dashboard",
+                "⌂",
+                onHome
+            )
+
+            GeoFareMenuCard(
+                "Trip History",
+                "See completed trips",
+                "◷",
+                onTrips
+            )
+
+            GeoFareMenuCard(
+                "Profile",
+                "Passenger information",
+                "♙",
+                onProfile
+            )
+
+            GeoFareMenuCard(
+                "Settings",
+                "Preferences and account",
+                "⚙",
+                onSettings
+            )
+
+            GeoFareMenuCard(
+                "Notifications",
+                "Recent alerts",
+                "◉",
+                onNotifications
+            )
+
+            GeoFareMenuCard(
+                "Help & Support",
+                "Need assistance?",
+                "?",
+                onHelp
+            )
+
+            GeoFareMenuCard(
+                "About GeoFare",
+                "App information",
+                "ⓘ",
+                onAbout
+            )
 
             Spacer(Modifier.height(12.dp))
-            Box(
-                Modifier
-                    .fillMaxWidth()
-                    .background(Color(0xFFEAF5FF), RoundedCornerShape(18.dp))
-                    .padding(14.dp)
-            ) {
-                Text(
-                    "The account screens, login, and signup visuals are prepared as UI-only placeholders for the design phase.",
-                    fontSize = 11.sp,
-                    color = Color(0xFF4C667B),
-                    lineHeight = 16.sp
-                )
-            }
+
+            GeoFareMenuCard(
+                "Sign Out",
+                "End the current account session",
+                "⇥",
+                onLogout
+            )
         }
     }
 }
+
 
 @Composable
 fun SplashScreen(onContinue: () -> Unit) {
@@ -1456,31 +2627,252 @@ fun SplashScreen(onContinue: () -> Unit) {
             .background(Color(0xFF0B4F8C)),
         contentAlignment = Alignment.Center
     ) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
             Box(
                 Modifier
                     .size(96.dp)
-                    .background(Color.White, RoundedCornerShape(28.dp)),
+                    .background(
+                        Color.White,
+                        RoundedCornerShape(28.dp)
+                    ),
                 contentAlignment = Alignment.Center
             ) {
-                Text("GF", fontSize = 30.sp, fontWeight = FontWeight.ExtraBold, color = Color(0xFF0B4F8C))
+                Text(
+                    "GF",
+                    fontSize = 30.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    color = Color(0xFF0B4F8C)
+                )
             }
+
             Spacer(Modifier.height(18.dp))
-            Text("GeoFare", fontSize = 32.sp, fontWeight = FontWeight.ExtraBold, color = Color.White)
-            Text("Passenger App", fontSize = 13.sp, color = Color.White.copy(alpha = 0.82f))
+
+            Text(
+                "GeoFare",
+                fontSize = 32.sp,
+                fontWeight = FontWeight.ExtraBold,
+                color = Color.White
+            )
+
+            Text(
+                "Passenger App",
+                fontSize = 13.sp,
+                color = Color.White.copy(alpha = 0.82f)
+            )
+
             Spacer(Modifier.height(28.dp))
+
             TextButton(onClick = onContinue) {
-                Text("CONTINUE", color = Color.White, fontWeight = FontWeight.Bold)
+                Text(
+                    "CONTINUE",
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold
+                )
             }
         }
     }
 }
 
+
 @Composable
 fun LoginScreen(
     onBack: () -> Unit,
-    onCreateAccount: () -> Unit
+    onCreateAccount: () -> Unit,
+    onSignedIn: () -> Unit
 ) {
+    val context = LocalContext.current
+    val auth = geoFareFirebaseAuth
+
+    var identifier by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
+    var verificationCode by remember { mutableStateOf("") }
+    var verificationId by remember { mutableStateOf<String?>(null) }
+    var passwordVisible by remember { mutableStateOf(false) }
+
+    var isLoading by remember { mutableStateOf(false) }
+    var errorText by remember { mutableStateOf("") }
+    var successText by remember { mutableStateOf("") }
+
+    val coroutineScope = rememberCoroutineScope()
+
+    fun validateEmailLogin(): Boolean {
+        val clean = identifier.trim()
+
+        if (clean.isBlank()) {
+            errorText = "Enter your email or phone number."
+            return false
+        }
+
+        if (clean.contains("@")) {
+            if (!Patterns.EMAIL_ADDRESS.matcher(clean).matches()) {
+                errorText = "Enter a valid email address."
+                return false
+            }
+
+            if (password.length < 1) {
+                errorText = "Enter your password."
+                return false
+            }
+        } else if (!isValidPhoneNumber(clean)) {
+            errorText = "Enter a valid email address or phone number."
+            return false
+        }
+
+        return true
+    }
+
+    fun signInWithEmail() {
+        val email = identifier.trim()
+        isLoading = true
+        errorText = ""
+        successText = ""
+
+        auth
+            .signInWithEmailAndPassword(
+                email,
+                password
+            )
+            .addOnSuccessListener {
+                isLoading = false
+                onSignedIn()
+            }
+            .addOnFailureListener { exception ->
+                isLoading = false
+                errorText = friendlyFirebaseAuthError(exception)
+            }
+    }
+
+    fun requestPhoneCode() {
+        val activity = context as? Activity
+
+        if (activity == null) {
+            errorText = "Phone verification is unavailable on this screen."
+            return
+        }
+
+        val phone = normalizePhoneNumber(identifier)
+
+        if (!isValidPhoneNumber(phone)) {
+            errorText = "Enter a valid phone number."
+            return
+        }
+
+        isLoading = true
+        errorText = ""
+        successText = ""
+        verificationId = null
+        verificationCode = ""
+
+        val callbacks =
+            object : PhoneAuthProvider.OnVerificationStateChangedCallbacks() {
+
+                override fun onVerificationCompleted(
+                    credential: PhoneAuthCredential
+                ) {
+                    auth
+                        .signInWithCredential(credential)
+                        .addOnSuccessListener {
+                            isLoading = false
+                            onSignedIn()
+                        }
+                        .addOnFailureListener { exception ->
+                            isLoading = false
+                            errorText = friendlyFirebaseAuthError(exception)
+                        }
+                }
+
+                override fun onVerificationFailed(
+                    exception: FirebaseException
+                ) {
+                    isLoading = false
+                    errorText =
+                        friendlyFirebaseAuthError(exception)
+                }
+
+                override fun onCodeSent(
+                    providerVerificationId: String,
+                    token: PhoneAuthProvider.ForceResendingToken
+                ) {
+                    isLoading = false
+                    verificationId = providerVerificationId
+                    successText =
+                        "Verification code sent to $phone."
+                }
+            }
+
+        val options =
+            PhoneAuthOptions.newBuilder(auth)
+                .setPhoneNumber(phone)
+                .setTimeout(60L, TimeUnit.SECONDS)
+                .setActivity(activity)
+                .setCallbacks(callbacks)
+                .build()
+
+        PhoneAuthProvider.verifyPhoneNumber(options)
+    }
+
+    fun verifyPhoneCode() {
+        val id = verificationId
+
+        if (id.isNullOrBlank()) {
+            errorText = "Request a verification code first."
+            return
+        }
+
+        if (verificationCode.trim().length < 6) {
+            errorText = "Enter the 6-digit verification code."
+            return
+        }
+
+        isLoading = true
+        errorText = ""
+
+        val credential =
+            PhoneAuthProvider.getCredential(
+                id,
+                verificationCode.trim()
+            )
+
+        auth
+            .signInWithCredential(credential)
+            .addOnSuccessListener {
+                isLoading = false
+                onSignedIn()
+            }
+            .addOnFailureListener { exception ->
+                isLoading = false
+                errorText = friendlyFirebaseAuthError(exception)
+            }
+    }
+
+    fun sendPasswordReset() {
+        val email = identifier.trim()
+
+        if (!Patterns.EMAIL_ADDRESS.matcher(email).matches()) {
+            errorText =
+                "Forgot password for email/password accounts requires your email address. Phone sign-in uses SMS verification."
+            return
+        }
+
+        isLoading = true
+        errorText = ""
+        successText = ""
+
+        auth
+            .sendPasswordResetEmail(email)
+            .addOnSuccessListener {
+                isLoading = false
+                successText =
+                    "Password reset instructions were sent to $email."
+            }
+            .addOnFailureListener { exception ->
+                isLoading = false
+                errorText = friendlyFirebaseAuthError(exception)
+            }
+    }
+
     Box(
         Modifier
             .fillMaxSize()
@@ -1493,47 +2885,534 @@ fun LoginScreen(
                 .verticalScroll(rememberScrollState()),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            GeoFareSimpleTopBar("Sign In", onBack)
+            GeoFareSimpleTopBar(
+                "Sign In",
+                onBack
+            )
+
             Spacer(Modifier.height(20.dp))
 
             Box(
                 Modifier
                     .size(72.dp)
-                    .background(Color(0xFF0B4F8C), RoundedCornerShape(22.dp)),
+                    .background(
+                        Color(0xFF0B4F8C),
+                        RoundedCornerShape(22.dp)
+                    ),
                 contentAlignment = Alignment.Center
             ) {
-                Text("GF", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.ExtraBold)
+                Text(
+                    "GF",
+                    color = Color.White,
+                    fontSize = 22.sp,
+                    fontWeight = FontWeight.ExtraBold
+                )
             }
+
             Spacer(Modifier.height(12.dp))
-            Text("Welcome back", fontSize = 25.sp, fontWeight = FontWeight.ExtraBold, color = Color(0xFF0B4F8C))
-            Text("UI-only sign in screen", fontSize = 12.sp, color = Color(0xFF71879B))
-            Spacer(Modifier.height(22.dp))
 
-            OutlinedTextField(value = "", onValueChange = {}, enabled = false, modifier = Modifier.fillMaxWidth(), label = { Text("Email") })
+            Text(
+                "Welcome back",
+                fontSize = 25.sp,
+                fontWeight = FontWeight.ExtraBold,
+                color = Color(0xFF0B4F8C)
+            )
+
+            Text(
+                "Sign in to continue using GeoFare.",
+                fontSize = 12.sp,
+                color = Color(0xFF71879B)
+            )
+
+            Spacer(Modifier.height(20.dp))
+
+            OutlinedTextField(
+                value = identifier,
+                onValueChange = {
+                    identifier = it
+                    errorText = ""
+                    successText = ""
+                },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Email or phone number") },
+                placeholder = {
+                    Text("you@example.com or 09XXXXXXXXX")
+                },
+                singleLine = true,
+                isError = errorText.isNotBlank()
+            )
+
             Spacer(Modifier.height(10.dp))
-            OutlinedTextField(value = "", onValueChange = {}, enabled = false, modifier = Modifier.fillMaxWidth(), label = { Text("Password") })
-            Spacer(Modifier.height(16.dp))
 
-            Button(
-                onClick = {},
-                modifier = Modifier.fillMaxWidth().height(56.dp),
-                shape = RoundedCornerShape(18.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1476C9))
-            ) { Text("SIGN IN", fontWeight = FontWeight.Bold) }
+            OutlinedTextField(
+                value = password,
+                onValueChange = {
+                    password = it
+                    errorText = ""
+                },
+                modifier = Modifier.fillMaxWidth(),
+                label = {
+                    Text(
+                        if (
+                            identifier.contains("@")
+                        ) {
+                            "Password"
+                        } else {
+                            "Password (email sign-in)"
+                        }
+                    )
+                },
+                singleLine = true,
+                visualTransformation = if (passwordVisible) {
+                    VisualTransformation.None
+                } else {
+                    PasswordVisualTransformation()
+                },
+                trailingIcon = {
+                    TextButton(
+                        onClick = {
+                            passwordVisible = !passwordVisible
+                        }
+                    ) {
+                        Text(
+                            if (passwordVisible) "HIDE" else "SHOW",
+                            fontSize = 11.sp
+                        )
+                    }
+                },
+                isError = errorText.isNotBlank()
+            )
+
+            Spacer(Modifier.height(6.dp))
+
+            Text(
+                text =
+                    if (identifier.contains("@")) {
+                        "Use your GeoFare email and password, or continue with Google."
+                    } else {
+                        "Phone sign-in uses an SMS verification code."
+                    },
+                modifier = Modifier.fillMaxWidth(),
+                fontSize = 11.sp,
+                color = Color(0xFF71879B)
+            )
+
+            if (verificationId != null) {
+                Spacer(Modifier.height(12.dp))
+
+                OutlinedTextField(
+                    value = verificationCode,
+                    onValueChange = {
+                        verificationCode =
+                            it.filter(Char::isDigit).take(6)
+                        errorText = ""
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("SMS verification code") },
+                    placeholder = { Text("123456") },
+                    singleLine = true,
+                    isError = errorText.isNotBlank()
+                )
+
+                Spacer(Modifier.height(10.dp))
+
+                Button(
+                    onClick = { verifyPhoneCode() },
+                    enabled = !isLoading,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(52.dp),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFF0B6CC4)
+                    )
+                ) {
+                    Text(
+                        "VERIFY SMS CODE",
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            } else {
+                Spacer(Modifier.height(16.dp))
+
+                Button(
+                    onClick = {
+                        errorText = ""
+                        successText = ""
+
+                        if (!validateEmailLogin()) {
+                            return@Button
+                        }
+
+                        if (identifier.contains("@")) {
+                            signInWithEmail()
+                        } else {
+                            requestPhoneCode()
+                        }
+                    },
+                    enabled = !isLoading,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(56.dp),
+                    shape = RoundedCornerShape(18.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFF1476C9)
+                    )
+                ) {
+                    if (isLoading) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(20.dp),
+                            strokeWidth = 2.dp,
+                            color = Color.White
+                        )
+                    } else {
+                        Text(
+                            "SIGN IN",
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+            }
 
             Spacer(Modifier.height(8.dp))
+
+            TextButton(
+                onClick = { sendPasswordReset() },
+                enabled = !isLoading
+            ) {
+                Text(
+                    "Forgot password?",
+                    color = Color(0xFF1476C9),
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            Spacer(Modifier.height(6.dp))
+
+            Button(
+                onClick = {
+                    errorText = ""
+                    successText = ""
+                    isLoading = true
+
+                    coroutineScope.launch {
+                        completeGeoFareGoogleSignIn(
+                            context = context,
+                            onSuccess = {
+                                isLoading = false
+                                onSignedIn()
+                            },
+                            onFailure = { exception ->
+                                isLoading = false
+                                errorText =
+                                    friendlyFirebaseAuthError(exception)
+                            }
+                        )
+                    }
+                },
+                enabled = !isLoading,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(52.dp),
+                shape = RoundedCornerShape(16.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color.White,
+                    contentColor = Color(0xFF14324A)
+                )
+            ) {
+                Text(
+                    "CONTINUE WITH GOOGLE",
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            if (errorText.isNotBlank()) {
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    errorText,
+                    modifier = Modifier.fillMaxWidth(),
+                    color = Color(0xFFB3261E),
+                    fontSize = 12.sp
+                )
+            }
+
+            if (successText.isNotBlank()) {
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    successText,
+                    modifier = Modifier.fillMaxWidth(),
+                    color = Color(0xFF2E7D32),
+                    fontSize = 12.sp
+                )
+            }
+
+            Spacer(Modifier.height(12.dp))
+
             TextButton(onClick = onCreateAccount) {
-                Text("Create an account", color = Color(0xFF1476C9), fontWeight = FontWeight.Bold)
+                Text(
+                    "Create an account",
+                    color = Color(0xFF1476C9),
+                    fontWeight = FontWeight.Bold
+                )
             }
         }
     }
 }
 
+
+
 @Composable
 fun SignUpScreen(
     onBack: () -> Unit,
-    onSignIn: () -> Unit
+    onSignIn: () -> Unit,
+    onSignedUp: () -> Unit
 ) {
+    val context = LocalContext.current
+    val auth = geoFareFirebaseAuth
+
+    var fullName by remember { mutableStateOf("") }
+    var email by remember { mutableStateOf("") }
+    var phoneNumber by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
+    var confirmPassword by remember { mutableStateOf("") }
+
+    var verificationCode by remember { mutableStateOf("") }
+    var verificationId by remember { mutableStateOf<String?>(null) }
+
+    var passwordVisible by remember { mutableStateOf(false) }
+    var confirmPasswordVisible by remember { mutableStateOf(false) }
+
+    var isLoading by remember { mutableStateOf(false) }
+    var errorText by remember { mutableStateOf("") }
+    var successText by remember { mutableStateOf("") }
+
+    val coroutineScope = rememberCoroutineScope()
+
+    fun validateSignUp(): Boolean {
+        val name = fullName.trim()
+        val emailValue = email.trim()
+
+        if (name.length < 2) {
+            errorText = "Enter your full name."
+            return false
+        }
+
+        if (!Patterns.EMAIL_ADDRESS.matcher(emailValue).matches()) {
+            errorText = "Enter a valid email address."
+            return false
+        }
+
+        if (!isValidPhoneNumber(phoneNumber)) {
+            errorText = "Enter a valid phone number."
+            return false
+        }
+
+        if (password.length < 8) {
+            errorText = "Password must be at least 8 characters."
+            return false
+        }
+
+        if (!password.any { it.isLetter() } ||
+            !password.any { it.isDigit() }
+        ) {
+            errorText =
+                "Password must include at least one letter and one number."
+            return false
+        }
+
+        if (password != confirmPassword) {
+            errorText = "Passwords do not match."
+            return false
+        }
+
+        return true
+    }
+
+    fun finishAccountCreation(user: FirebaseUser) {
+        val cleanName = fullName.trim()
+        val normalizedPhone = normalizePhoneNumber(phoneNumber)
+
+        updateGeoFareDisplayName(
+            user = user,
+            fullName = cleanName,
+            onSuccess = {
+                saveGeoFareUserProfile(
+                    user = user,
+                    fullName = cleanName,
+                    phoneNumber = normalizedPhone,
+                    onSuccess = {
+                        isLoading = false
+                        successText = ""
+                        onSignedUp()
+                    },
+                    onFailure = { exception ->
+                        isLoading = false
+                        errorText =
+                            exception.message
+                                ?: "Your account was created, but the profile could not be saved."
+                    }
+                )
+            },
+            onFailure = { exception ->
+                isLoading = false
+                errorText =
+                    exception.message
+                        ?: "Your account was created, but the profile name could not be saved."
+            }
+        )
+    }
+
+    fun linkEmailPasswordToPhoneUser(user: FirebaseUser) {
+        val credential =
+            EmailAuthProvider.getCredential(
+                email.trim(),
+                password
+            )
+
+        user
+            .linkWithCredential(credential)
+            .addOnSuccessListener { result ->
+                val linkedUser = result.user ?: user
+                finishAccountCreation(linkedUser)
+            }
+            .addOnFailureListener { exception ->
+                isLoading = false
+
+                if (
+                    exception.message.orEmpty().contains(
+                        "provider-already-linked",
+                        ignoreCase = true
+                    )
+                ) {
+                    finishAccountCreation(user)
+                } else {
+                    errorText =
+                        friendlyFirebaseAuthError(exception)
+                }
+            }
+    }
+
+    fun verifyPhoneCodeAndCreateAccount() {
+        val id = verificationId
+
+        if (id.isNullOrBlank()) {
+            errorText = "Request a verification code first."
+            return
+        }
+
+        if (verificationCode.trim().length < 6) {
+            errorText = "Enter the 6-digit verification code."
+            return
+        }
+
+        isLoading = true
+        errorText = ""
+        successText = ""
+
+        val credential =
+            PhoneAuthProvider.getCredential(
+                id,
+                verificationCode.trim()
+            )
+
+        auth
+            .signInWithCredential(credential)
+            .addOnSuccessListener { result ->
+                val phoneUser = result.user
+
+                if (phoneUser == null) {
+                    isLoading = false
+                    errorText =
+                        "Phone verification succeeded but no user was returned."
+                    return@addOnSuccessListener
+                }
+
+                linkEmailPasswordToPhoneUser(phoneUser)
+            }
+            .addOnFailureListener { exception ->
+                isLoading = false
+                errorText = friendlyFirebaseAuthError(exception)
+            }
+    }
+
+    fun requestPhoneVerification() {
+        val activity = context as? Activity
+
+        if (activity == null) {
+            errorText = "Phone verification is unavailable on this screen."
+            return
+        }
+
+        val phone = normalizePhoneNumber(phoneNumber)
+
+        if (!isValidPhoneNumber(phone)) {
+            errorText = "Enter a valid phone number."
+            return
+        }
+
+        isLoading = true
+        errorText = ""
+        successText = ""
+        verificationId = null
+        verificationCode = ""
+
+        val callbacks =
+            object : PhoneAuthProvider.OnVerificationStateChangedCallbacks() {
+
+                override fun onVerificationCompleted(
+                    credential: PhoneAuthCredential
+                ) {
+                    auth
+                        .signInWithCredential(credential)
+                        .addOnSuccessListener { result ->
+                            val phoneUser = result.user
+
+                            if (phoneUser == null) {
+                                isLoading = false
+                                errorText =
+                                    "Phone verification succeeded but no user was returned."
+                                return@addOnSuccessListener
+                            }
+
+                            linkEmailPasswordToPhoneUser(phoneUser)
+                        }
+                        .addOnFailureListener { exception ->
+                            isLoading = false
+                            errorText =
+                                friendlyFirebaseAuthError(exception)
+                        }
+                }
+
+                override fun onVerificationFailed(
+                    exception: FirebaseException
+                ) {
+                    isLoading = false
+                    errorText =
+                        friendlyFirebaseAuthError(exception)
+                }
+
+                override fun onCodeSent(
+                    providerVerificationId: String,
+                    token: PhoneAuthProvider.ForceResendingToken
+                ) {
+                    isLoading = false
+                    verificationId = providerVerificationId
+                    successText =
+                        "Verification code sent to $phone."
+                }
+            }
+
+        val options =
+            PhoneAuthOptions.newBuilder(auth)
+                .setPhoneNumber(phone)
+                .setTimeout(60L, TimeUnit.SECONDS)
+                .setActivity(activity)
+                .setCallbacks(callbacks)
+                .build()
+
+        PhoneAuthProvider.verifyPhoneNumber(options)
+    }
+
     Box(
         Modifier
             .fillMaxSize()
@@ -1546,29 +3425,298 @@ fun SignUpScreen(
                 .verticalScroll(rememberScrollState()),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            GeoFareSimpleTopBar("Create Account", onBack)
+            GeoFareSimpleTopBar(
+                "Create Account",
+                onBack
+            )
+
             Spacer(Modifier.height(16.dp))
-            Text("Set up your GeoFare account", fontSize = 23.sp, fontWeight = FontWeight.ExtraBold, color = Color(0xFF0B4F8C))
+
+            Text(
+                "Set up your GeoFare account",
+                fontSize = 23.sp,
+                fontWeight = FontWeight.ExtraBold,
+                color = Color(0xFF0B4F8C)
+            )
+
             Spacer(Modifier.height(6.dp))
-            Text("UI-only signup screen for the design phase.", fontSize = 12.sp, color = Color(0xFF71879B))
+
+            Text(
+                "Your email/password and verified phone number are linked to the same GeoFare account.",
+                fontSize = 12.sp,
+                color = Color(0xFF71879B),
+                textAlign = TextAlign.Center
+            )
+
             Spacer(Modifier.height(20.dp))
 
-            OutlinedTextField(value = "", onValueChange = {}, enabled = false, modifier = Modifier.fillMaxWidth(), label = { Text("Full name") })
+            OutlinedTextField(
+                value = fullName,
+                onValueChange = {
+                    fullName = it
+                    errorText = ""
+                },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Full name") },
+                singleLine = true,
+                isError = errorText.isNotBlank()
+            )
+
             Spacer(Modifier.height(10.dp))
-            OutlinedTextField(value = "", onValueChange = {}, enabled = false, modifier = Modifier.fillMaxWidth(), label = { Text("Email") })
+
+            OutlinedTextField(
+                value = email,
+                onValueChange = {
+                    email = it
+                    errorText = ""
+                },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Email") },
+                placeholder = { Text("you@example.com") },
+                singleLine = true,
+                isError = errorText.isNotBlank()
+            )
+
             Spacer(Modifier.height(10.dp))
-            OutlinedTextField(value = "", onValueChange = {}, enabled = false, modifier = Modifier.fillMaxWidth(), label = { Text("Password") })
-            Spacer(Modifier.height(16.dp))
+
+            OutlinedTextField(
+                value = phoneNumber,
+                onValueChange = {
+                    phoneNumber = it
+                    errorText = ""
+                },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Phone number") },
+                placeholder = { Text("09XXXXXXXXX") },
+                singleLine = true,
+                isError = errorText.isNotBlank(),
+                enabled = verificationId == null
+            )
+
+            Spacer(Modifier.height(10.dp))
+
+            OutlinedTextField(
+                value = password,
+                onValueChange = {
+                    password = it
+                    errorText = ""
+                },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Password") },
+                singleLine = true,
+                visualTransformation = if (passwordVisible) {
+                    VisualTransformation.None
+                } else {
+                    PasswordVisualTransformation()
+                },
+                trailingIcon = {
+                    TextButton(
+                        onClick = {
+                            passwordVisible = !passwordVisible
+                        }
+                    ) {
+                        Text(
+                            if (passwordVisible) "HIDE" else "SHOW",
+                            fontSize = 11.sp
+                        )
+                    }
+                },
+                isError = errorText.isNotBlank(),
+                enabled = verificationId == null
+            )
+
+            Spacer(Modifier.height(10.dp))
+
+            OutlinedTextField(
+                value = confirmPassword,
+                onValueChange = {
+                    confirmPassword = it
+                    errorText = ""
+                },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Confirm password") },
+                singleLine = true,
+                visualTransformation = if (confirmPasswordVisible) {
+                    VisualTransformation.None
+                } else {
+                    PasswordVisualTransformation()
+                },
+                trailingIcon = {
+                    TextButton(
+                        onClick = {
+                            confirmPasswordVisible =
+                                !confirmPasswordVisible
+                        }
+                    ) {
+                        Text(
+                            if (confirmPasswordVisible) "HIDE" else "SHOW",
+                            fontSize = 11.sp
+                        )
+                    }
+                },
+                isError = errorText.isNotBlank(),
+                enabled = verificationId == null
+            )
+
+            if (verificationId != null) {
+                Spacer(Modifier.height(12.dp))
+
+                OutlinedTextField(
+                    value = verificationCode,
+                    onValueChange = {
+                        verificationCode =
+                            it.filter(Char::isDigit).take(6)
+                        errorText = ""
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("SMS verification code") },
+                    placeholder = { Text("123456") },
+                    singleLine = true,
+                    isError = errorText.isNotBlank()
+                )
+
+                Spacer(Modifier.height(12.dp))
+
+                Button(
+                    onClick = {
+                        verifyPhoneCodeAndCreateAccount()
+                    },
+                    enabled = !isLoading,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(56.dp),
+                    shape = RoundedCornerShape(18.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFF1476C9)
+                    )
+                ) {
+                    if (isLoading) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(20.dp),
+                            strokeWidth = 2.dp,
+                            color = Color.White
+                        )
+                    } else {
+                        Text(
+                            "VERIFY PHONE & CREATE ACCOUNT",
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+
+                Spacer(Modifier.height(8.dp))
+
+                TextButton(
+                    onClick = {
+                        requestPhoneVerification()
+                    },
+                    enabled = !isLoading
+                ) {
+                    Text(
+                        "Resend verification code",
+                        color = Color(0xFF1476C9),
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            } else {
+                Spacer(Modifier.height(16.dp))
+
+                Button(
+                    onClick = {
+                        if (validateSignUp()) {
+                            requestPhoneVerification()
+                        }
+                    },
+                    enabled = !isLoading,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(56.dp),
+                    shape = RoundedCornerShape(18.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFF1476C9)
+                    )
+                ) {
+                    if (isLoading) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(20.dp),
+                            strokeWidth = 2.dp,
+                            color = Color.White
+                        )
+                    } else {
+                        Text(
+                            "SIGN UP",
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(8.dp))
 
             Button(
-                onClick = {},
-                modifier = Modifier.fillMaxWidth().height(56.dp),
-                shape = RoundedCornerShape(18.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1476C9))
-            ) { Text("CREATE ACCOUNT", fontWeight = FontWeight.Bold) }
+                onClick = {
+                    errorText = ""
+                    isLoading = true
+
+                    coroutineScope.launch {
+                        completeGeoFareGoogleSignIn(
+                            context = context,
+                            onSuccess = {
+                                isLoading = false
+                                onSignedUp()
+                            },
+                            onFailure = { exception ->
+                                isLoading = false
+                                errorText =
+                                    friendlyFirebaseAuthError(exception)
+                            }
+                        )
+                    }
+                },
+                enabled = !isLoading && verificationId == null,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(52.dp),
+                shape = RoundedCornerShape(16.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color.White,
+                    contentColor = Color(0xFF14324A)
+                )
+            ) {
+                Text(
+                    "SIGN UP WITH GOOGLE",
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            if (errorText.isNotBlank()) {
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    errorText,
+                    modifier = Modifier.fillMaxWidth(),
+                    color = Color(0xFFB3261E),
+                    fontSize = 12.sp
+                )
+            }
+
+            if (successText.isNotBlank()) {
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    successText,
+                    modifier = Modifier.fillMaxWidth(),
+                    color = Color(0xFF2E7D32),
+                    fontSize = 12.sp
+                )
+            }
+
+            Spacer(Modifier.height(10.dp))
 
             TextButton(onClick = onSignIn) {
-                Text("Already have an account? Sign in", color = Color(0xFF1476C9), fontWeight = FontWeight.Bold)
+                Text(
+                    "Already have an account? Sign in",
+                    color = Color(0xFF1476C9),
+                    fontWeight = FontWeight.Bold
+                )
             }
         }
     }
@@ -1592,9 +3740,9 @@ fun TripCompletedScreen(
 
     fare: Double,
 
-    pickupLocation: Location?,
+    pickupAddress: String,
 
-    destinationLocation: GeoPoint?,
+    destinationAddress: String,
 
     completedAt: String,
 
@@ -1750,29 +3898,19 @@ fun TripCompletedScreen(
                         }
                     )
 
-                    pickupLocation?.let { pickup ->
-                        CompletedTripRow(
-                            "Pickup",
-                            String.format(
-                                Locale.US,
-                                "%.6f, %.6f",
-                                pickup.latitude,
-                                pickup.longitude
-                            )
-                        )
-                    }
+                    CompletedTripRow(
+                        "Pickup",
+                        pickupAddress.ifBlank {
+                            "Current Location"
+                        }
+                    )
 
-                    destinationLocation?.let { destination ->
-                        CompletedTripRow(
-                            "Destination",
-                            String.format(
-                                Locale.US,
-                                "%.6f, %.6f",
-                                destination.latitude,
-                                destination.longitude
-                            )
-                        )
-                    }
+                    CompletedTripRow(
+                        "Destination",
+                        destinationAddress.ifBlank {
+                            "Selected Destination"
+                        }
+                    )
                 }
             }
 
@@ -2465,9 +4603,11 @@ fun generateQrBitmap(
 
 @Composable
 fun GeoFareHomeScreen(
+    onHome: () -> Unit,
     onStartTrip: () -> Unit,
     onTripHistory: () -> Unit,
     onNotifications: () -> Unit,
+    onSettings: () -> Unit,
     onProfile: () -> Unit,
     onMore: () -> Unit
 ) {
@@ -2528,6 +4668,14 @@ fun GeoFareHomeScreen(
                     Text(
                         "◉",
                         fontSize = 24.sp,
+                        color = navy
+                    )
+                }
+
+                TextButton(onClick = onSettings) {
+                    Text(
+                        "⚙",
+                        fontSize = 22.sp,
                         color = navy
                     )
                 }
@@ -2683,7 +4831,7 @@ fun GeoFareHomeScreen(
 
         GeoFareBottomNav(
             active = "HOME",
-            onHome = {},
+            onHome = onHome,
             onTrips = onTripHistory,
             onStart = onStartTrip,
             onProfile = onProfile,
@@ -4460,41 +6608,31 @@ fun processPlateImage(
 
 
 /* =========================================================
-   LOCATION SCREEN
+   AUTOMATIC PICKUP LOCATION ACQUISITION
    ========================================================= */
 
 @SuppressLint("MissingPermission")
 @Composable
-fun LocationScreen(
-
+fun AutomaticPickupLocationScreen(
     onBack: () -> Unit,
-
-    onLocationConfirmed:
-        (Location) -> Unit
-
+    onLocationAcquired: (Location) -> Unit,
+    onPickupAddressResolved: (String) -> Unit
 ) {
 
     val context =
         LocalContext.current
 
     var locationPermissionGranted by remember {
-
         mutableStateOf(
-
             ContextCompat.checkSelfPermission(
                 context,
                 Manifest.permission.ACCESS_FINE_LOCATION
             ) == PackageManager.PERMISSION_GRANTED ||
-
                     ContextCompat.checkSelfPermission(
                         context,
                         Manifest.permission.ACCESS_COARSE_LOCATION
                     ) == PackageManager.PERMISSION_GRANTED
         )
-    }
-
-    var currentLocation by remember {
-        mutableStateOf<Location?>(null)
     }
 
     var isLoading by remember {
@@ -4505,13 +6643,114 @@ fun LocationScreen(
         mutableStateOf("")
     }
 
+    fun startLocationAcquisition() {
+
+        if (!locationPermissionGranted) {
+            locationError =
+                "GeoFare needs your location to determine your pickup point and calculate your fare."
+
+            return
+        }
+
+        isLoading = true
+        locationError = ""
+
+        val locationClient =
+            LocationServices
+                .getFusedLocationProviderClient(
+                    context
+                )
+
+        locationClient
+            .getCurrentLocation(
+                Priority.PRIORITY_HIGH_ACCURACY,
+                null
+            )
+            .addOnSuccessListener { location ->
+
+                if (location == null) {
+
+                    isLoading = false
+
+                    locationError =
+                        "Unable to get your current location. Please enable GPS/location services and try again."
+
+                    return@addOnSuccessListener
+                }
+
+                // The pickup is now valid. Continue the user workflow
+                // immediately; reverse geocoding is only for the internal
+                // pickup address record.
+                isLoading = false
+
+                onLocationAcquired(
+                    location
+                )
+
+                onPickupAddressResolved(
+                    "Current Location"
+                )
+
+                reverseGeocodeDestination(
+                    context = context,
+                    point = GeoPoint(
+                        location.latitude,
+                        location.longitude
+                    ),
+                    onSuccess = { info ->
+
+                        if (info != null) {
+
+                            val barangayPart =
+                                info
+                                    .barangayLabel()
+                                    .takeIf {
+                                        !it.equals(
+                                            "Barangay could not be identified",
+                                            ignoreCase = true
+                                        )
+                                    }
+
+                            val municipalityProvince =
+                                info
+                                    .municipalityProvinceLabel()
+
+                            val resolved =
+                                listOfNotNull(
+                                    barangayPart,
+                                    municipalityProvince
+                                        .takeIf {
+                                            it !=
+                                                    "Location details unavailable"
+                                        }
+                                ).joinToString(", ")
+
+                            if (resolved.isNotBlank()) {
+                                onPickupAddressResolved(
+                                    resolved
+                                )
+                            }
+                        }
+                    },
+                    onFailure = {
+                        // Keep "Current Location" internally when
+                        // reverse geocoding is unavailable.
+                    }
+                )
+            }
+            .addOnFailureListener { exception ->
+
+                isLoading = false
+
+                locationError =
+                    exception.message
+                        ?: "Unable to get your current location. Please enable GPS/location services and try again."
+            }
+    }
+
     val permissionLauncher =
         rememberLauncherForActivityResult(
-
-            contract =
-                ActivityResultContracts
-                    .RequestMultiplePermissions()
-
+            ActivityResultContracts.RequestMultiplePermissions()
         ) { permissions ->
 
             locationPermissionGranted =
@@ -4521,28 +6760,30 @@ fun LocationScreen(
                         permissions[
                             Manifest.permission.ACCESS_COARSE_LOCATION
                         ] == true
+
+            if (locationPermissionGranted) {
+                startLocationAcquisition()
+            } else {
+                isLoading = false
+
+                locationError =
+                    "GeoFare needs your location to determine your pickup point and calculate your fare."
+            }
         }
 
     LaunchedEffect(Unit) {
 
-        if (!locationPermissionGranted) {
-
+        if (locationPermissionGranted) {
+            startLocationAcquisition()
+        } else {
             permissionLauncher.launch(
-
                 arrayOf(
-
-                    Manifest.permission
-                        .ACCESS_FINE_LOCATION,
-
-                    Manifest.permission
-                        .ACCESS_COARSE_LOCATION
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION
                 )
             )
         }
     }
-
-    val geoFareBlue =
-        Color(0xFF0D4F8B)
 
     Box(
         modifier =
@@ -4555,7 +6796,6 @@ fun LocationScreen(
     ) {
 
         Column(
-
             modifier =
                 Modifier.fillMaxSize(),
 
@@ -4566,16 +6806,44 @@ fun LocationScreen(
                 Arrangement.Center
         ) {
 
-            Text(
-                text = "Pickup Location",
+            Box(
+                modifier =
+                    Modifier
+                        .size(76.dp)
+                        .background(
+                            Color(0xFFEAF5FF),
+                            RoundedCornerShape(24.dp)
+                        ),
+                contentAlignment =
+                    Alignment.Center
+            ) {
+                Text(
+                    "⌖",
+                    fontSize = 38.sp,
+                    color = Color(0xFF0D4F8B)
+                )
+            }
 
-                fontSize = 30.sp,
+            Spacer(
+                modifier =
+                    Modifier.height(20.dp)
+            )
+
+            Text(
+                text =
+                    "Getting your current location...",
+
+                fontSize =
+                    24.sp,
 
                 fontWeight =
                     FontWeight.Bold,
 
                 color =
-                    geoFareBlue
+                    Color(0xFF0D4F8B),
+
+                textAlign =
+                    TextAlign.Center
             )
 
             Spacer(
@@ -4584,27 +6852,42 @@ fun LocationScreen(
             )
 
             Text(
-                text = "Step 3",
-                fontSize = 16.sp,
-                color = Color.Gray
+                text =
+                    "Your current GPS position will be used as the pickup point.",
+
+                fontSize =
+                    14.sp,
+
+                color =
+                    Color(0xFF6C8294),
+
+                textAlign =
+                    TextAlign.Center
             )
 
             Spacer(
                 modifier =
-                    Modifier.height(30.dp)
+                    Modifier.height(24.dp)
             )
 
-            if (!locationPermissionGranted) {
+            if (isLoading) {
+
+                CircularProgressIndicator(
+                    color =
+                        Color(0xFF1476C9)
+                )
+
+            } else if (locationError.isNotBlank()) {
 
                 Text(
                     text =
-                        "Location permission is required\n" +
-                                "to determine your pickup point.",
+                        locationError,
 
-                    fontSize = 16.sp,
+                    fontSize =
+                        14.sp,
 
                     color =
-                        Color.DarkGray,
+                        Color(0xFFD32F2F),
 
                     textAlign =
                         TextAlign.Center
@@ -4612,98 +6895,31 @@ fun LocationScreen(
 
                 Spacer(
                     modifier =
-                        Modifier.height(20.dp)
+                        Modifier.height(16.dp)
                 )
 
                 Button(
                     onClick = {
 
-                        permissionLauncher.launch(
+                        if (!locationPermissionGranted) {
 
-                            arrayOf(
-
-                                Manifest.permission
-                                    .ACCESS_FINE_LOCATION,
-
-                                Manifest.permission
-                                    .ACCESS_COARSE_LOCATION
-                            )
-                        )
-                    }
-                ) {
-
-                    Text(
-                        text = "ALLOW LOCATION"
-                    )
-                }
-
-            } else {
-
-                Text(
-                    text = "Your current location",
-
-                    fontSize = 18.sp,
-
-                    fontWeight =
-                        FontWeight.SemiBold
-                )
-
-                Spacer(
-                    modifier =
-                        Modifier.height(20.dp)
-                )
-
-                Button(
-
-                    onClick = {
-
-                        isLoading = true
-                        locationError = ""
-
-                        val locationClient =
-                            LocationServices
-                                .getFusedLocationProviderClient(
-                                    context
+                            permissionLauncher.launch(
+                                arrayOf(
+                                    Manifest.permission.ACCESS_FINE_LOCATION,
+                                    Manifest.permission.ACCESS_COARSE_LOCATION
                                 )
-
-                        locationClient
-                            .getCurrentLocation(
-
-                                Priority
-                                    .PRIORITY_HIGH_ACCURACY,
-
-                                null
-
                             )
-                            .addOnSuccessListener { location ->
 
-                                isLoading = false
+                        } else {
 
-                                if (location != null) {
-
-                                    currentLocation =
-                                        location
-
-                                } else {
-
-                                    locationError =
-                                        "Unable to obtain a location."
-                                }
-                            }
-                            .addOnFailureListener { exception ->
-
-                                isLoading = false
-
-                                locationError =
-                                    exception.message
-                                        ?: "Location request failed."
-                            }
+                            startLocationAcquisition()
+                        }
                     },
 
                     modifier =
                         Modifier
                             .fillMaxWidth()
-                            .height(55.dp),
+                            .height(54.dp),
 
                     shape =
                         RoundedCornerShape(16.dp),
@@ -4711,180 +6927,34 @@ fun LocationScreen(
                     colors =
                         ButtonDefaults.buttonColors(
                             containerColor =
-                                geoFareBlue
+                                Color(0xFF1476C9)
                         )
                 ) {
 
                     Text(
-                        text =
-                            "GET CURRENT LOCATION",
-
-                        fontSize = 16.sp,
-
+                        "TRY AGAIN",
                         fontWeight =
                             FontWeight.Bold
                     )
                 }
-
-                Spacer(
-                    modifier =
-                        Modifier.height(25.dp)
-                )
-
-                when {
-
-                    isLoading -> {
-
-                        CircularProgressIndicator()
-                    }
-
-                    currentLocation != null -> {
-
-                        Box(
-
-                            modifier =
-                                Modifier
-                                    .fillMaxWidth()
-                                    .background(
-                                        Color.White,
-                                        RoundedCornerShape(16.dp)
-                                    )
-                                    .padding(20.dp)
-                        ) {
-
-                            Column {
-
-                                Text(
-                                    text =
-                                        "GPS LOCATION",
-
-                                    fontSize = 14.sp,
-
-                                    color =
-                                        Color.Gray,
-
-                                    fontWeight =
-                                        FontWeight.Bold
-                                )
-
-                                Spacer(
-                                    modifier =
-                                        Modifier.height(10.dp)
-                                )
-
-                                Text(
-                                    text =
-                                        "Latitude: %.6f".format(
-                                            Locale.US,
-                                            currentLocation!!.latitude
-                                        ),
-
-                                    fontSize = 17.sp
-                                )
-
-                                Spacer(
-                                    modifier =
-                                        Modifier.height(6.dp)
-                                )
-
-                                Text(
-                                    text =
-                                        "Longitude: %.6f".format(
-                                            Locale.US,
-                                            currentLocation!!.longitude
-                                        ),
-
-                                    fontSize = 17.sp
-                                )
-
-                                Spacer(
-                                    modifier =
-                                        Modifier.height(6.dp)
-                                )
-
-                                Text(
-                                    text =
-                                        "Accuracy: %.1f meters".format(
-                                            Locale.US,
-                                            currentLocation!!.accuracy
-                                        ),
-
-                                    fontSize = 15.sp,
-
-                                    color =
-                                        Color.Gray
-                                )
-                            }
-                        }
-                    }
-
-                    locationError.isNotBlank() -> {
-
-                        Text(
-                            text = locationError,
-
-                            color =
-                                Color(0xFFD32F2F),
-
-                            textAlign =
-                                TextAlign.Center
-                        )
-                    }
-                }
             }
+        }
 
-            Spacer(
-                modifier =
-                    Modifier.weight(1f)
-            )
-
-            Button(
-
-                onClick = {
-
-                    currentLocation?.let { location ->
-
-                        onLocationConfirmed(location)
-                    }
-                },
-
-                enabled =
-                    currentLocation != null,
-
-                modifier =
-                    Modifier
-                        .fillMaxWidth()
-                        .height(55.dp),
-
-                shape =
-                    RoundedCornerShape(16.dp),
-
-                colors =
-                    ButtonDefaults.buttonColors(
-                        containerColor =
-                            Color(0xFF2E7D32)
+        TextButton(
+            onClick = onBack,
+            modifier =
+                Modifier
+                    .align(
+                        Alignment.BottomCenter
                     )
-            ) {
-
-                Text(
-                    text =
-                        "CONTINUE TO DESTINATION",
-
-                    fontSize = 16.sp,
-
-                    fontWeight =
-                        FontWeight.Bold
-                )
-            }
-
-            TextButton(
-                onClick = onBack
-            ) {
-
-                Text(
-                    text = "BACK"
-                )
-            }
+        ) {
+            Text(
+                "BACK",
+                color =
+                    Color(0xFF6B4FB3),
+                fontWeight =
+                    FontWeight.Bold
+            )
         }
     }
 }
@@ -5351,6 +7421,7 @@ private fun reverseGeocodeWithNominatim(
 }
 
 
+
 /* =========================================================
    DESTINATION SCREEN
    ========================================================= */
@@ -5359,12 +7430,15 @@ private fun reverseGeocodeWithNominatim(
 fun DestinationScreen(
     pickupLatitude: Double,
     pickupLongitude: Double,
+    pickupAddress: String,
     onBack: () -> Unit,
+    onDestinationSelected: () -> Unit,
     onRouteCalculated:
         (
         destination: GeoPoint,
         distanceMeters: Double,
-        durationSeconds: Double
+        durationSeconds: Double,
+        destinationInfo: DestinationPlaceInfo
     ) -> Unit
 ) {
 
@@ -5415,6 +7489,10 @@ fun DestinationScreen(
         mutableStateOf("")
     }
 
+    var searchFocusMessage by remember {
+        mutableStateOf("")
+    }
+
     var isRouting by remember {
         mutableStateOf(false)
     }
@@ -5429,6 +7507,10 @@ fun DestinationScreen(
 
     var routeError by remember {
         mutableStateOf("")
+    }
+
+    var selectionToken by remember {
+        mutableStateOf(0)
     }
 
     val mapView =
@@ -5457,10 +7539,14 @@ fun DestinationScreen(
                     pickupPoint
 
                 title =
-                    "Pickup Location"
+                    "Pickup / Current Location"
 
                 snippet =
-                    "Current GPS location"
+                    if (pickupAddress.isBlank()) {
+                        "Current GPS pickup point"
+                    } else {
+                        pickupAddress
+                    }
 
                 setAnchor(
                     Marker.ANCHOR_CENTER,
@@ -5469,7 +7555,7 @@ fun DestinationScreen(
             }
         }
 
-    val locationOverlay =
+    val currentLocationOverlay =
         remember(mapView) {
             MyLocationNewOverlay(
                 GpsMyLocationProvider(context),
@@ -5484,6 +7570,7 @@ fun DestinationScreen(
     }
 
     fun clearRouteFromMap() {
+
         mapView.overlays.removeAll {
             it is Polyline
         }
@@ -5492,6 +7579,7 @@ fun DestinationScreen(
     fun placeDestinationMarker(
         point: GeoPoint
     ) {
+
         destinationMarker?.let {
             mapView.overlays.remove(it)
         }
@@ -5503,10 +7591,10 @@ fun DestinationScreen(
                     point
 
                 title =
-                    "Destination"
+                    "Drop-off / Destination"
 
                 snippet =
-                    "GeoFare selected drop-off location"
+                    "Passenger selected exact drop-off point"
 
                 setAnchor(
                     Marker.ANCHOR_CENTER,
@@ -5514,7 +7602,8 @@ fun DestinationScreen(
                 )
             }
 
-        destinationMarker = marker
+        destinationMarker =
+            marker
 
         mapView.overlays.add(
             marker
@@ -5534,9 +7623,89 @@ fun DestinationScreen(
         mapView.invalidate()
     }
 
+    fun calculateSelectedRoute(
+        point: GeoPoint,
+        resolvedInfo: DestinationPlaceInfo,
+        requestToken: Int
+    ) {
+
+        if (requestToken != selectionToken) {
+            return
+        }
+
+        isRouting = true
+        routeError = ""
+
+        fetchOsrmRoute(
+            pickup = pickupPoint,
+            destination = point,
+            onSuccess = {
+                    distance,
+                    duration,
+                    geometry ->
+
+                if (requestToken != selectionToken) {
+                    return@fetchOsrmRoute
+                }
+
+                isRouting = false
+
+                routeDistanceMeters =
+                    distance
+
+                routeDurationSeconds =
+                    duration
+
+                mapView.overlays.removeAll {
+                    it is Polyline
+                }
+
+                val routeLine =
+                    Polyline(mapView).apply {
+                        title = "GeoFare Route"
+                        setPoints(geometry)
+                    }
+
+                mapView.overlays.add(
+                    routeLine
+                )
+
+                placeDestinationMarker(
+                    point
+                )
+
+                mapView.invalidate()
+
+                onRouteCalculated(
+                    point,
+                    distance,
+                    duration,
+                    resolvedInfo
+                )
+            },
+            onFailure = { error ->
+
+                if (requestToken != selectionToken) {
+                    return@fetchOsrmRoute
+                }
+
+                isRouting = false
+
+                routeError =
+                    error
+            }
+        )
+    }
+
     fun resolveDestination(
         point: GeoPoint
     ) {
+
+        selectionToken += 1
+
+        val requestToken =
+            selectionToken
+
         selectedDestination =
             point
 
@@ -5546,8 +7715,14 @@ fun DestinationScreen(
         isResolvingDestination =
             true
 
+        isRouting =
+            false
+
         destinationStatusMessage =
             "Identifying destination..."
+
+        searchFocusMessage =
+            ""
 
         routeDistanceMeters =
             null
@@ -5564,22 +7739,31 @@ fun DestinationScreen(
             point
         )
 
+        // This is the user's actual exact drop-off confirmation.
+        onDestinationSelected()
+
         reverseGeocodeDestination(
             context = context,
             point = point,
-
             onSuccess = { info ->
+
+                if (requestToken != selectionToken) {
+                    return@reverseGeocodeDestination
+                }
 
                 isResolvingDestination =
                     false
 
-                if (info == null) {
+                if (
+                    info == null ||
+                    info.barangay.isNullOrBlank()
+                ) {
 
                     destinationInfo =
                         null
 
                     destinationStatusMessage =
-                        "Barangay could not be identified."
+                        "Barangay could not be identified. Select another location."
 
                     return@reverseGeocodeDestination
                 }
@@ -5588,17 +7772,21 @@ fun DestinationScreen(
                     info
 
                 destinationStatusMessage =
-                    if (
-                        info.barangay
-                            .isNullOrBlank()
-                    ) {
-                        "Barangay could not be identified."
-                    } else {
-                        "Destination identified."
-                    }
-            },
+                    "Destination identified."
 
+                // Once the exact destination is identified,
+                // automatically calculate the road route.
+                calculateSelectedRoute(
+                    point = point,
+                    resolvedInfo = info,
+                    requestToken = requestToken
+                )
+            },
             onFailure = { exception ->
+
+                if (requestToken != selectionToken) {
+                    return@reverseGeocodeDestination
+                }
 
                 isResolvingDestination =
                     false
@@ -5615,8 +7803,7 @@ fun DestinationScreen(
 
     DisposableEffect(
         mapView,
-        pickupMarker,
-        locationOverlay
+        pickupMarker
     ) {
 
         val mapReceiver =
@@ -5627,14 +7814,10 @@ fun DestinationScreen(
                     point: GeoPoint
                 ): Boolean {
 
-                    searchQuery =
-                        ""
-
-                    searchResults =
-                        emptyList()
-
-                    searchError =
-                        ""
+                    searchQuery = ""
+                    searchResults = emptyList()
+                    searchError = ""
+                    searchFocusMessage = ""
 
                     resolveDestination(
                         GeoPoint(
@@ -5668,7 +7851,6 @@ fun DestinationScreen(
         )
 
         try {
-
             if (
                 ContextCompat.checkSelfPermission(
                     context,
@@ -5679,33 +7861,41 @@ fun DestinationScreen(
                     Manifest.permission.ACCESS_COARSE_LOCATION
                 ) == PackageManager.PERMISSION_GRANTED
             ) {
-
-                locationOverlay
-                    .enableMyLocation()
-
+                currentLocationOverlay.enableMyLocation()
                 mapView.overlays.add(
-                    locationOverlay
+                    currentLocationOverlay
                 )
             }
-
         } catch (exception: Exception) {
-
             Log.e(
                 "GeoFareMap",
-                "Unable to enable location overlay",
+                "Unable to enable current-location overlay",
                 exception
             )
         }
 
-        mapView.invalidate()
+        if (
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.ACCESS_FINE_LOCATION
+            ) == PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.ACCESS_COARSE_LOCATION
+            ) == PackageManager.PERMISSION_GRANTED
+        ) {
+            try {
+                mapView.invalidate()
+            } catch (exception: Exception) {
+                Log.e(
+                    "GeoFareMap",
+                    "Unable to refresh destination map",
+                    exception
+                )
+            }
+        }
 
         onDispose {
-
-            try {
-                locationOverlay
-                    .disableMyLocation()
-            } catch (_: Exception) {
-            }
 
             mapView.overlays.remove(
                 mapEventsOverlay
@@ -5715,8 +7905,13 @@ fun DestinationScreen(
                 pickupMarker
             )
 
+            try {
+                currentLocationOverlay.disableMyLocation()
+            } catch (_: Exception) {
+            }
+
             mapView.overlays.remove(
-                locationOverlay
+                currentLocationOverlay
             )
 
             destinationMarker?.let {
@@ -5768,8 +7963,7 @@ fun DestinationScreen(
             onSuccess = { results ->
 
                 if (
-                    searchQuery
-                        .trim() ==
+                    searchQuery.trim() ==
                     queryAtRequest
                 ) {
 
@@ -5792,8 +7986,7 @@ fun DestinationScreen(
             onFailure = { exception ->
 
                 if (
-                    searchQuery
-                        .trim() ==
+                    searchQuery.trim() ==
                     queryAtRequest
                 ) {
 
@@ -5846,7 +8039,8 @@ fun DestinationScreen(
             Column {
 
                 Text(
-                    text = "Select Destination",
+                    text =
+                        "Select Destination",
                     fontSize = 24.sp,
                     fontWeight = FontWeight.Bold,
                     color = Color(0xFF0D4F8B)
@@ -5859,7 +8053,7 @@ fun DestinationScreen(
 
                 Text(
                     text =
-                        "Search for a place or tap directly on the map.",
+                        "Search for a place to focus the map, then tap the exact drop-off point.",
                     fontSize = 14.sp,
                     color = Color.DarkGray
                 )
@@ -5876,6 +8070,9 @@ fun DestinationScreen(
                     onValueChange = {
                         searchQuery =
                             it
+
+                        searchFocusMessage =
+                            ""
                     },
 
                     modifier =
@@ -5887,7 +8084,7 @@ fun DestinationScreen(
 
                     placeholder = {
                         Text(
-                            "Search drop-off location..."
+                            "Search barangay or area..."
                         )
                     },
 
@@ -5895,8 +8092,7 @@ fun DestinationScreen(
                         Text(
                             text = "⌕",
                             fontSize = 24.sp,
-                            color =
-                                Color(0xFF0D4F8B)
+                            color = Color(0xFF0D4F8B)
                         )
                     },
 
@@ -5983,6 +8179,8 @@ fun DestinationScreen(
                                 Button(
                                     onClick = {
 
+                                        // Search results only focus the map.
+                                        // They do NOT become the selected destination.
                                         searchQuery =
                                             result.name
 
@@ -5992,9 +8190,21 @@ fun DestinationScreen(
                                         searchError =
                                             ""
 
-                                        resolveDestination(
+                                        searchFocusMessage =
+                                            "Search result focused. Tap the exact drop-off point on the map."
+
+                                        mapView.controller.animateTo(
                                             result.point
                                         )
+
+                                        mapView.controller.setZoom(
+                                            maxOf(
+                                                mapView.zoomLevelDouble,
+                                                17.0
+                                            )
+                                        )
+
+                                        mapView.invalidate()
                                     },
 
                                     modifier =
@@ -6003,9 +8213,7 @@ fun DestinationScreen(
                                             .height(64.dp),
 
                                     shape =
-                                        RoundedCornerShape(
-                                            0.dp
-                                        ),
+                                        RoundedCornerShape(0.dp),
 
                                     colors =
                                         ButtonDefaults
@@ -6035,16 +8243,12 @@ fun DestinationScreen(
 
                                         Spacer(
                                             modifier =
-                                                Modifier.width(
-                                                    10.dp
-                                                )
+                                                Modifier.width(10.dp)
                                         )
 
                                         Column(
                                             modifier =
-                                                Modifier.weight(
-                                                    1f
-                                                ),
+                                                Modifier.weight(1f),
 
                                             horizontalAlignment =
                                                 Alignment.Start
@@ -6060,7 +8264,8 @@ fun DestinationScreen(
                                                 fontWeight =
                                                     FontWeight.Bold,
 
-                                                maxLines = 1
+                                                maxLines =
+                                                    1
                                             )
 
                                             Text(
@@ -6073,7 +8278,8 @@ fun DestinationScreen(
                                                 color =
                                                     Color.Gray,
 
-                                                maxLines = 2
+                                                maxLines =
+                                                    2
                                             )
                                         }
                                     }
@@ -6094,9 +8300,7 @@ fun DestinationScreen(
                                     modifier =
                                         Modifier
                                             .fillMaxWidth()
-                                            .padding(
-                                                14.dp
-                                            ),
+                                            .padding(14.dp),
 
                                     fontSize = 12.sp,
                                     color =
@@ -6110,6 +8314,30 @@ fun DestinationScreen(
                             }
                         }
                     }
+                }
+
+                if (
+                    searchFocusMessage.isNotBlank()
+                ) {
+
+                    Spacer(
+                        modifier =
+                            Modifier.height(6.dp)
+                    )
+
+                    Text(
+                        text =
+                            searchFocusMessage,
+
+                        fontSize =
+                            12.sp,
+
+                        color =
+                            Color(0xFF0D4F8B),
+
+                        textAlign =
+                            TextAlign.Center
+                    )
                 }
             }
         }
@@ -6173,7 +8401,23 @@ fun DestinationScreen(
 
                 Text(
                     text =
-                        "Tap the map or search for a drop-off location.",
+                        "Pickup: ${pickupAddress.ifBlank { "Current Location" }}",
+
+                    fontSize = 13.sp,
+                    color = Color(0xFF5C7184),
+
+                    textAlign =
+                        TextAlign.Center
+                )
+
+                Spacer(
+                    modifier =
+                        Modifier.height(8.dp)
+                )
+
+                Text(
+                    text =
+                        "Tap the map after focusing a search result to select the exact drop-off point.",
 
                     fontSize = 15.sp,
                     color = Color.Gray,
@@ -6200,9 +8444,26 @@ fun DestinationScreen(
                         Modifier.height(7.dp)
                 )
 
-                if (
-                    isResolvingDestination
-                ) {
+                Text(
+                    text =
+                        "Pickup • ${pickupAddress.ifBlank { "Current Location" }}",
+
+                    fontSize =
+                        12.sp,
+
+                    color =
+                        Color(0xFF5C7184),
+
+                    textAlign =
+                        TextAlign.Center
+                )
+
+                Spacer(
+                    modifier =
+                        Modifier.height(7.dp)
+                )
+
+                if (isResolvingDestination) {
 
                     CircularProgressIndicator(
                         modifier =
@@ -6217,10 +8478,9 @@ fun DestinationScreen(
 
                     Text(
                         text =
-                            destinationStatusMessage
-                                .ifBlank {
-                                    "Identifying destination..."
-                                },
+                            destinationStatusMessage.ifBlank {
+                                "Identifying destination..."
+                            },
 
                         fontSize = 13.sp,
 
@@ -6263,17 +8523,14 @@ fun DestinationScreen(
 
                         fontSize = 14.sp,
 
-                        color =
-                            Color.DarkGray,
+                        color = Color.DarkGray,
 
                         textAlign =
                             TextAlign.Center
                     )
 
                     if (
-                        destinationInfo!!
-                            .placeName
-                            .isNotBlank()
+                        destinationInfo!!.placeName.isNotBlank()
                     ) {
 
                         Spacer(
@@ -6299,10 +8556,18 @@ fun DestinationScreen(
                     }
 
                     if (
-                        destinationInfo!!
-                            .barangay
-                            .isNullOrBlank()
+                        isRouting
                     ) {
+
+                        Spacer(
+                            modifier =
+                                Modifier.height(10.dp)
+                        )
+
+                        CircularProgressIndicator(
+                            modifier =
+                                Modifier.size(23.dp)
+                        )
 
                         Spacer(
                             modifier =
@@ -6311,15 +8576,61 @@ fun DestinationScreen(
 
                         Text(
                             text =
-                                "Barangay could not be identified. Select another location.",
+                                "Calculating route and fare...",
 
-                            fontSize = 12.sp,
+                            fontSize =
+                                14.sp,
 
                             color =
-                                Color(0xFFD32F2F),
+                                Color.Gray
+                        )
+                    }
 
-                            textAlign =
-                                TextAlign.Center
+                    if (
+                        routeDistanceMeters != null &&
+                        !isRouting
+                    ) {
+
+                        Spacer(
+                            modifier =
+                                Modifier.height(10.dp)
+                        )
+
+                        Text(
+                            text =
+                                "Road Distance: %.2f km".format(
+                                    Locale.US,
+                                    routeDistanceMeters!!
+                                            / 1000.0
+                                ),
+
+                            fontSize =
+                                18.sp,
+
+                            fontWeight =
+                                FontWeight.Bold,
+
+                            color =
+                                Color(0xFF0D4F8B)
+                        )
+
+                        Text(
+                            text =
+                                "Estimated Route Time: %d min".format(
+                                    Locale.US,
+                                    (
+                                            routeDurationSeconds
+                                                ?: 0.0
+                                            )
+                                        .div(60.0)
+                                        .toInt()
+                                ),
+
+                            fontSize =
+                                14.sp,
+
+                            color =
+                                Color.Gray
                         )
                     }
 
@@ -6327,12 +8638,12 @@ fun DestinationScreen(
 
                     Text(
                         text =
-                            destinationStatusMessage
-                                .ifBlank {
-                                    "Barangay could not be identified."
-                                },
+                            destinationStatusMessage.ifBlank {
+                                "Barangay could not be identified."
+                            },
 
-                        fontSize = 13.sp,
+                        fontSize =
+                            13.sp,
 
                         color =
                             Color(0xFFD32F2F),
@@ -6341,107 +8652,66 @@ fun DestinationScreen(
                             TextAlign.Center
                     )
                 }
-            }
 
-            if (
-                isRouting
-            ) {
+                if (
+                    routeError.isNotBlank()
+                ) {
 
-                Spacer(
-                    modifier =
-                        Modifier.height(10.dp)
-                )
+                    Spacer(
+                        modifier =
+                            Modifier.height(8.dp)
+                    )
 
-                CircularProgressIndicator()
+                    Text(
+                        text =
+                            routeError,
 
-                Spacer(
-                    modifier =
-                        Modifier.height(6.dp)
-                )
+                        fontSize =
+                            13.sp,
 
-                Text(
-                    text =
-                        "Calculating road route...",
+                        color =
+                            Color(0xFFD32F2F),
 
-                    fontSize =
-                        14.sp,
+                        textAlign =
+                            TextAlign.Center
+                    )
 
-                    color =
-                        Color.Gray
-                )
-            }
+                    Spacer(
+                        modifier =
+                            Modifier.height(8.dp)
+                    )
 
-            if (
-                routeDistanceMeters != null
-            ) {
+                    TextButton(
+                        onClick = {
 
-                Spacer(
-                    modifier =
-                        Modifier.height(10.dp)
-                )
+                            val point =
+                                selectedDestination
+                                    ?: return@TextButton
 
-                Text(
-                    text =
-                        "Road Distance: %.2f km"
-                            .format(
-                                Locale.US,
-                                routeDistanceMeters!!
-                                        / 1000.0
-                            ),
+                            val info =
+                                destinationInfo
+                                    ?: return@TextButton
 
-                    fontSize =
-                        18.sp,
+                            calculateSelectedRoute(
+                                point = point,
+                                resolvedInfo = info,
+                                requestToken =
+                                    selectionToken
+                            )
+                        },
 
-                    fontWeight =
-                        FontWeight.Bold,
-
-                    color =
-                        Color(0xFF0D4F8B)
-                )
-
-                Text(
-                    text =
-                        "Estimated Route Time: %d min"
-                            .format(
-                                Locale.US,
-                                (
-                                        routeDurationSeconds
-                                            ?: 0.0
-                                        )
-                                    .div(60.0)
-                                    .toInt()
-                            ),
-
-                    fontSize =
-                        14.sp,
-
-                    color =
-                        Color.Gray
-                )
-            }
-
-            if (
-                routeError.isNotBlank()
-            ) {
-
-                Spacer(
-                    modifier =
-                        Modifier.height(8.dp)
-                )
-
-                Text(
-                    text =
-                        routeError,
-
-                    fontSize =
-                        13.sp,
-
-                    color =
-                        Color(0xFFD32F2F),
-
-                    textAlign =
-                        TextAlign.Center
-                )
+                        enabled =
+                            !isRouting
+                    ) {
+                        Text(
+                            "TRY AGAIN",
+                            color =
+                                Color(0xFF1476C9),
+                            fontWeight =
+                                FontWeight.Bold
+                        )
+                    }
+                }
             }
 
             Spacer(
@@ -6449,145 +8719,15 @@ fun DestinationScreen(
                     Modifier.height(12.dp)
             )
 
-            Button(
-                onClick = {
-
-                    val destination =
-                        selectedDestination
-                            ?: return@Button
-
-                    isRouting =
-                        true
-
-                    routeError =
-                        ""
-
-                    fetchOsrmRoute(
-
-                        pickup =
-                            pickupPoint,
-
-                        destination =
-                            destination,
-
-                        onSuccess = {
-                                distance,
-                                duration,
-                                geometry ->
-
-                            isRouting =
-                                false
-
-                            routeDistanceMeters =
-                                distance
-
-                            routeDurationSeconds =
-                                duration
-
-                            mapView
-                                .overlays
-                                .removeAll {
-                                    it is Polyline
-                                }
-
-                            val routeLine =
-                                Polyline(
-                                    mapView
-                                )
-
-                            routeLine.title =
-                                "GeoFare Route"
-
-                            routeLine.setPoints(
-                                geometry
-                            )
-
-                            mapView
-                                .overlays
-                                .add(
-                                    routeLine
-                                )
-
-                            placeDestinationMarker(
-                                destination
-                            )
-
-                            mapView.invalidate()
-
-                            onRouteCalculated(
-                                destination,
-                                distance,
-                                duration
-                            )
-                        },
-
-                        onFailure = { error ->
-
-                            isRouting =
-                                false
-
-                            routeError =
-                                error
-                        }
-                    )
-                },
-
-                enabled =
-                    selectedDestination != null &&
-                            destinationInfo != null &&
-                            destinationInfo!!
-                                .barangay
-                                ?.isNotBlank() == true &&
-                            !isResolvingDestination &&
-                            !isRouting,
-
-                modifier =
-                    Modifier
-                        .fillMaxWidth()
-                        .height(56.dp),
-
-                shape =
-                    RoundedCornerShape(16.dp),
-
-                colors =
-                    ButtonDefaults.buttonColors(
-                        containerColor =
-                            Color(0xFF2E7D32),
-
-                        disabledContainerColor =
-                            Color(0xFFD9DEE3)
-                    )
-            ) {
-
-                Text(
-                    text =
-                        if (
-                            routeDistanceMeters != null
-                        ) {
-                            "ROUTE CALCULATED"
-                        } else {
-                            "CONFIRM & CALCULATE ROUTE"
-                        },
-
-                    fontSize =
-                        16.sp,
-
-                    fontWeight =
-                        FontWeight.Bold
-                )
-            }
-
             TextButton(
-                onClick =
-                    onBack,
-
-                enabled =
-                    !isRouting
+                onClick = onBack,
+                enabled = !isRouting
             ) {
 
                 Text(
-                    text =
-                        "BACK"
+                    "BACK",
+                    color =
+                        Color(0xFF6B4FB3)
                 )
             }
         }
@@ -6601,37 +8741,43 @@ fun DestinationScreen(
 
 @Composable
 fun FareEstimateScreen(
-
+    pickupAddress: String,
+    destinationInfo: DestinationPlaceInfo?,
     distanceMeters: Double,
-
     durationSeconds: Double,
-
     fare: Double,
-
+    onFareDisplayed: () -> Unit,
     onBack: () -> Unit,
-
     onConfirmFare: () -> Unit
-
 ) {
 
     val distanceKm =
         distanceMeters / 1000.0
 
-    Box(
+    LaunchedEffect(Unit) {
+        // The study's latency end point is the moment the
+        // fare result screen becomes visible.
+        onFareDisplayed()
+    }
 
+    Box(
         modifier =
             Modifier
                 .fillMaxSize()
                 .background(
                     Color(0xFFF5F9FC)
                 )
-                .padding(24.dp)
+                .padding(20.dp)
     ) {
 
         Column(
-
             modifier =
-                Modifier.fillMaxSize(),
+                Modifier
+                    .fillMaxSize()
+                    .verticalScroll(
+                        rememberScrollState()
+                    )
+                    .padding(bottom = 16.dp),
 
             horizontalAlignment =
                 Alignment.CenterHorizontally
@@ -6639,15 +8785,15 @@ fun FareEstimateScreen(
 
             Spacer(
                 modifier =
-                    Modifier.height(25.dp)
+                    Modifier.height(20.dp)
             )
 
             Text(
-
                 text =
-                    "Fare Estimate",
+                    "Trip Fare",
 
-                fontSize = 30.sp,
+                fontSize =
+                    30.sp,
 
                 fontWeight =
                     FontWeight.Bold,
@@ -6658,120 +8804,80 @@ fun FareEstimateScreen(
 
             Spacer(
                 modifier =
-                    Modifier.height(8.dp)
+                    Modifier.height(6.dp)
             )
 
             Text(
+                text =
+                    "Route and fare calculated",
 
-                text = "Step 5",
+                fontSize =
+                    14.sp,
 
-                fontSize = 16.sp,
-
-                color = Color.Gray
+                color =
+                    Color(0xFF71879B)
             )
 
             Spacer(
                 modifier =
-                    Modifier.height(25.dp)
+                    Modifier.height(18.dp)
             )
 
             Box(
-
-                modifier =
-                    Modifier
-                        .fillMaxWidth()
-                        .background(
-                            Color(0xFFFFF3CD),
-                            RoundedCornerShape(14.dp)
-                        )
-                        .padding(16.dp)
-            ) {
-
-                Column {
-
-                    Text(
-
-                        text =
-                            "DEMO FARE MATRIX",
-
-                        fontSize = 14.sp,
-
-                        fontWeight =
-                            FontWeight.Bold,
-
-                        color =
-                            Color(0xFF856404)
-                    )
-
-                    Spacer(
-                        modifier =
-                            Modifier.height(6.dp)
-                    )
-
-                    Text(
-
-                        text =
-                            "Base fare: ₱15.00\n" +
-                                    "Includes first 1.00 km\n" +
-                                    "Succeeding: ₱5.00 per started km",
-
-                        fontSize = 14.sp,
-
-                        color =
-                            Color(0xFF856404)
-                    )
-
-                    Spacer(
-                        modifier =
-                            Modifier.height(6.dp)
-                    )
-
-                    Text(
-
-                        text =
-                            "Temporary prototype values only.",
-
-                        fontSize = 12.sp,
-
-                        fontWeight =
-                            FontWeight.Bold,
-
-                        color =
-                            Color(0xFF856404)
-                    )
-                }
-            }
-
-            Spacer(
-                modifier =
-                    Modifier.height(20.dp)
-            )
-
-            Box(
-
                 modifier =
                     Modifier
                         .fillMaxWidth()
                         .background(
                             Color.White,
-                            RoundedCornerShape(18.dp)
+                            RoundedCornerShape(22.dp)
                         )
-                        .padding(20.dp)
+                        .padding(18.dp)
             ) {
 
                 Column {
 
                     Text(
-
                         text =
                             "TRIP DETAILS",
 
-                        fontSize = 14.sp,
-
-                        color = Color.Gray,
+                        fontSize =
+                            13.sp,
 
                         fontWeight =
-                            FontWeight.Bold
+                            FontWeight.Bold,
+
+                        color =
+                            Color(0xFF6C8294)
+                    )
+
+                    Spacer(
+                        modifier =
+                            Modifier.height(12.dp)
+                    )
+
+                    Text(
+                        text =
+                            "Pickup",
+
+                        fontSize =
+                            12.sp,
+
+                        color =
+                            Color(0xFF6C8294)
+                    )
+
+                    Text(
+                        text =
+                            "📍 $pickupAddress",
+
+                        fontSize =
+                            16.sp,
+
+                        fontWeight =
+                            FontWeight.SemiBold,
+
+                        color =
+                            Color(0xFF173E63)
                     )
 
                     Spacer(
@@ -6780,20 +8886,86 @@ fun FareEstimateScreen(
                     )
 
                     Text(
-                        text = "Road Distance",
-                        fontSize = 15.sp,
-                        color = Color.Gray
+                        text =
+                            "Drop-off",
+
+                        fontSize =
+                            12.sp,
+
+                        color =
+                            Color(0xFF6C8294)
+                    )
+
+                    if (destinationInfo != null) {
+
+                        Text(
+                            text =
+                                "📍 ${destinationInfo.barangayLabel()}",
+
+                            fontSize =
+                                16.sp,
+
+                            fontWeight =
+                                FontWeight.SemiBold,
+
+                            color =
+                                Color(0xFF173E63)
+                        )
+
+                        Text(
+                            text =
+                                destinationInfo
+                                    .municipalityProvinceLabel(),
+
+                            fontSize =
+                                13.sp,
+
+                            color =
+                                Color(0xFF71879B)
+                        )
+
+                    } else {
+
+                        Text(
+                            text =
+                                "Destination",
+
+                            fontSize =
+                                16.sp,
+
+                            fontWeight =
+                                FontWeight.SemiBold,
+
+                            color =
+                                Color(0xFF173E63)
+                        )
+                    }
+
+                    Spacer(
+                        modifier =
+                            Modifier.height(18.dp)
                     )
 
                     Text(
+                        text =
+                            "Distance",
 
+                        fontSize =
+                            12.sp,
+
+                        color =
+                            Color(0xFF6C8294)
+                    )
+
+                    Text(
                         text =
                             "%.2f km".format(
                                 Locale.US,
                                 distanceKm
                             ),
 
-                        fontSize = 22.sp,
+                        fontSize =
+                            20.sp,
 
                         fontWeight =
                             FontWeight.Bold,
@@ -6808,56 +8980,68 @@ fun FareEstimateScreen(
                     )
 
                     Text(
-
                         text =
-                            "Estimated Travel Time",
+                            "Estimated Route Time",
 
-                        fontSize = 15.sp,
+                        fontSize =
+                            12.sp,
 
-                        color = Color.Gray
+                        color =
+                            Color(0xFF6C8294)
                     )
 
                     Text(
-
                         text =
-                            "%d minutes".format(
+                            "%d min".format(
                                 Locale.US,
-                                (durationSeconds / 60.0).toInt()
+                                (durationSeconds / 60.0)
+                                    .toInt()
                             ),
 
-                        fontSize = 18.sp,
+                        fontSize =
+                            17.sp,
 
                         fontWeight =
-                            FontWeight.SemiBold
-                    )
+                            FontWeight.SemiBold,
 
-                    Spacer(
-                        modifier =
-                            Modifier.height(18.dp)
+                        color =
+                            Color(0xFF173E63)
                     )
+                }
+            }
+
+            Spacer(
+                modifier =
+                    Modifier.height(18.dp)
+            )
+
+            Box(
+                modifier =
+                    Modifier
+                        .fillMaxWidth()
+                        .background(
+                            Color(0xFFEAF7EE),
+                            RoundedCornerShape(24.dp)
+                        )
+                        .padding(
+                            horizontal = 20.dp,
+                            vertical = 22.dp
+                        )
+            ) {
+
+                Column(
+                    horizontalAlignment =
+                        Alignment.CenterHorizontally,
+                    modifier =
+                        Modifier.fillMaxWidth()
+                ) {
 
                     Text(
-
                         text =
-                            "CALCULATED FARE",
+                            "ESTIMATED FARE",
 
-                        fontSize = 14.sp,
-
-                        color = Color.Gray,
-
-                        fontWeight =
-                            FontWeight.Bold
-                    )
-
-                    Text(
-
-                        text =
-                            "₱%.2f".format(
-                                Locale.US,
-                                fare
-                            ),
-
-                        fontSize = 40.sp,
+                        fontSize =
+                            14.sp,
 
                         fontWeight =
                             FontWeight.Bold,
@@ -6865,16 +9049,40 @@ fun FareEstimateScreen(
                         color =
                             Color(0xFF2E7D32)
                     )
+
+                    Spacer(
+                        modifier =
+                            Modifier.height(6.dp)
+                    )
+
+                    Text(
+                        text =
+                            "₱%.2f".format(
+                                Locale.US,
+                                fare
+                            ),
+
+                        fontSize =
+                            44.sp,
+
+                        fontWeight =
+                            FontWeight.ExtraBold,
+
+                        color =
+                            Color(0xFF2E7D32),
+
+                        textAlign =
+                            TextAlign.Center
+                    )
                 }
             }
 
             Spacer(
                 modifier =
-                    Modifier.weight(1f)
+                    Modifier.height(20.dp)
             )
 
             Button(
-
                 onClick =
                     onConfirmFare,
 
@@ -6894,11 +9102,11 @@ fun FareEstimateScreen(
             ) {
 
                 Text(
-
                     text =
-                        "CONFIRM FARE",
+                        "CONFIRM TRIP",
 
-                    fontSize = 18.sp,
+                    fontSize =
+                        18.sp,
 
                     fontWeight =
                         FontWeight.Bold
@@ -6917,9 +9125,17 @@ fun FareEstimateScreen(
 
                 Text(
                     text =
-                        "BACK TO DESTINATION"
+                        "BACK TO DESTINATION",
+
+                    color =
+                        Color(0xFF6B4FB3)
                 )
             }
+
+            Spacer(
+                modifier =
+                    Modifier.height(8.dp)
+            )
         }
     }
 }
@@ -8997,3 +11213,4 @@ fun fetchOsrmRoute(
 
     }.start()
 }
+
