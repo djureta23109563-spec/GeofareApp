@@ -533,11 +533,8 @@ fun saveTripToFirestore(
                     "destinationAddress" to destinationAddress.ifBlank { "Selected Destination" },
                     "distanceKm" to (distanceMeters / 1000.0),
                     "fare" to fare,
-                    "passengerTimestamp" to timestamp,
-                    "status" to "PENDING",
-                    "routeStatus" to "WAITING_FOR_DRIVER",
-                    "createdAt" to com.google.firebase.firestore.FieldValue.serverTimestamp()
-                )
+                    "passengerTimestamp" to timestamp
+            )
 
             pickupAcquiredAtEpochMs?.let {
                 tripData["pickupAcquiredAtEpochMs"] = it
