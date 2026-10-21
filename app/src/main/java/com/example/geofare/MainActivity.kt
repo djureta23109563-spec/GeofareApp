@@ -145,6 +145,8 @@ import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
 import com.google.android.libraries.identity.googleid.GoogleIdTokenParsingException
 
 import com.google.firebase.FirebaseException
+import com.google.firebase.auth.FirebaseAuthException
+import com.google.firebase.auth.FirebaseAuthUserCollisionException
 import com.google.firebase.auth.EmailAuthProvider
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.GoogleAuthProvider
@@ -156,6 +158,7 @@ import com.google.firebase.auth.FirebaseUser
 import com.google.firebase.firestore.DocumentSnapshot
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.ListenerRegistration
+import com.google.firebase.functions.FirebaseFunctions
 
 
 
@@ -501,7 +504,6 @@ suspend fun completeGeoFareGoogleSignIn(
 
 
 fun saveTripToFirestore(
-    tripId: String,
     plate: String,
     pickup: Location?,
     pickupAddress: String,
@@ -515,16 +517,16 @@ fun saveTripToFirestore(
     fareComputationStartEpochMs: Long?,
     fareDisplayedAtEpochMs: Long?,
     fareComputationLatencyMs: Long?,
-    onSuccess: () -> Unit,
+    onSuccess: (tripId: String, token: String) -> Unit,
     onFailure: (Exception) -> Unit
 ) {
     ensureFirebaseAuthentication(
         onSuccess = { user ->
-            val tripData =
-                hashMapOf<String, Any?>(
-                    "tripId" to tripId,
-                    "passengerUid" to user.uid,
-                    "plate" to plate.ifBlank { "UNKNOWN" },
+            // All devices use the same Firebase project. The trusted callable
+            // creates the canonical trip ID, hashes an opaque QR token, sets
+            // its expiry on the server, and saves the PENDING trip atomically.
+            val tripData = hashMapOf<String, Any>(
+                "plate" to plate.ifBlank { "UNKNOWN" },
                     "pickupLat" to (pickup?.latitude ?: 0.0),
                     "pickupLng" to (pickup?.longitude ?: 0.0),
                     "pickupAddress" to pickupAddress.ifBlank { "Current Location" },
@@ -533,11 +535,8 @@ fun saveTripToFirestore(
                     "destinationAddress" to destinationAddress.ifBlank { "Selected Destination" },
                     "distanceKm" to (distanceMeters / 1000.0),
                     "fare" to fare,
-                    "passengerTimestamp" to timestamp,
-                    "status" to "PENDING",
-                    "routeStatus" to "WAITING_FOR_DRIVER",
-                    "createdAt" to com.google.firebase.firestore.FieldValue.serverTimestamp()
-                )
+                    "passengerTimestamp" to timestamp
+            )
 
             pickupAcquiredAtEpochMs?.let {
                 tripData["pickupAcquiredAtEpochMs"] = it
@@ -559,17 +558,29 @@ fun saveTripToFirestore(
                 tripData["fareComputationLatencyMs"] = it
             }
 
-            geoFareFirestore
-                .collection("trips")
-                .document(tripId)
-                .set(
-                    tripData,
-                    com.google.firebase.firestore.SetOptions.merge()
-                )
-                .addOnSuccessListener {
-                    onSuccess()
+            FirebaseFunctions.getInstance("asia-southeast1")
+                .getHttpsCallable("createPassengerTrip")
+                .call(tripData)
+                .addOnSuccessListener { result ->
+                    val response = result.data as? Map<*, *>
+                    val createdTripId = response?.get("tripId") as? String
+                    val token = response?.get("token") as? String
+                    if (createdTripId.isNullOrBlank() || token.isNullOrBlank()) {
+                        onFailure(
+                            IllegalStateException(
+                                "The server did not return a valid trip QR. Please try again."
+                            )
+                        )
+                    } else {
+                        onSuccess(createdTripId, token)
+                    }
                 }
                 .addOnFailureListener { exception ->
+                    Log.e(
+                        "GeoFareTrip",
+                        "Server rejected trip creation",
+                        exception
+                    )
                     onFailure(exception)
                 }
         },
@@ -930,6 +941,7 @@ fun GeoFareApp() {
 
     var tripId by remember { mutableStateOf("") }
     var qrPayload by remember { mutableStateOf("") }
+    var isSavingTrip by remember { mutableStateOf(false) }
     var firebaseError by remember { mutableStateOf("") }
     var completionTimestamp by remember { mutableStateOf("") }
     var selectedHistoryTrip by remember { mutableStateOf<TripHistoryItem?>(null) }
@@ -954,6 +966,7 @@ fun GeoFareApp() {
 
         tripId = ""
         qrPayload = ""
+        isSavingTrip = false
         firebaseError = ""
         completionTimestamp = ""
     }
@@ -1202,15 +1215,17 @@ fun GeoFareApp() {
                     }
                 },
                 onBack = {
+                    firebaseError = ""
                     currentScreen = "DESTINATION"
                 },
+                saveError = firebaseError,
+                isSaving = isSavingTrip,
                 onConfirmFare = {
-                    tripId =
-                        "GF-" +
-                                UUID.randomUUID()
-                                    .toString()
-                                    .take(8)
-                                    .uppercase()
+                    if (isSavingTrip) return@FareEstimateScreen
+
+                    isSavingTrip = true
+                    firebaseError = ""
+                    qrPayload = ""
 
                     val timestamp =
                         SimpleDateFormat(
@@ -1233,20 +1248,7 @@ fun GeoFareApp() {
                             }
                     }
 
-                    qrPayload =
-                        buildWebsiteTripUrl(
-                            tripId = tripId,
-                            plate = detectedPlate,
-                            pickup = pickupLocation,
-                            destination = destinationLocation,
-                            distanceMeters =
-                                routeDistanceMeters ?: 0.0,
-                            fare = calculatedFare ?: 0.0,
-                            timestamp = timestamp
-                        )
-
                     saveTripToFirestore(
-                        tripId = tripId,
                         plate = detectedPlate,
                         pickup = pickupLocation,
                         pickupAddress = pickupAddress,
@@ -1276,22 +1278,31 @@ fun GeoFareApp() {
                             fareDisplayedAtEpochMs,
                         fareComputationLatencyMs =
                             fareComputationLatencyMs,
-                        onSuccess = {
+                        onSuccess = { createdTripId, oneTimeToken ->
+                            isSavingTrip = false
+                            tripId = createdTripId
+                            qrPayload = buildWebsiteTripUrl(
+                                tripId = createdTripId,
+                                token = oneTimeToken
+                            )
                             firebaseError = ""
                             currentScreen = "QR"
                         },
                         onFailure = { exception ->
+                            isSavingTrip = false
+                            qrPayload = ""
+                            tripId = ""
                             firebaseError =
-                                exception.message
-                                    ?: "Unable to save trip to Firebase."
+                                "Trip could not be saved. No QR code was issued. " +
+                                    (exception.message ?: "Check your connection and try again.")
 
                             Log.e(
                                 "GeoFareFirebase",
-                                "Initial trip save failed",
+                                "Initial trip save failed; QR issuance blocked",
                                 exception
                             )
 
-                            currentScreen = "QR"
+                            currentScreen = "FARE"
                         }
                     )
                 }
@@ -2744,6 +2755,47 @@ fun LoginScreen(
             }
     }
 
+    /**
+     * Firebase phone sign-in can create an auth-only user for an unknown
+     * number. Login must not silently become account registration; require the
+     * GeoFare profile created by the explicit sign-up flow before proceeding.
+     */
+    fun continuePhoneSignInIfRegistered(user: FirebaseUser?) {
+        if (user == null) {
+            auth.signOut()
+            isLoading = false
+            errorText = "Phone verification returned no GeoFare account. Please try again."
+            return
+        }
+
+        geoFareFirestore
+            .collection("profiles")
+            .document(user.uid)
+            .get()
+            .addOnSuccessListener { profile ->
+                isLoading = false
+                if (profile.exists()) {
+                    onSignedIn()
+                } else {
+                    auth.signOut()
+                    errorText =
+                        "No GeoFare account is registered with this phone number. " +
+                            "Choose Create Account first."
+                }
+            }
+            .addOnFailureListener { exception ->
+                auth.signOut()
+                isLoading = false
+                Log.e(
+                    "GeoFareAuth",
+                    "Unable to verify phone account profile",
+                    exception
+                )
+                errorText =
+                    "Unable to verify your GeoFare account. Check your connection and try again."
+            }
+    }
+
     fun requestPhoneCode() {
         val activity = context as? Activity
 
@@ -2773,9 +2825,8 @@ fun LoginScreen(
                 ) {
                     auth
                         .signInWithCredential(credential)
-                        .addOnSuccessListener {
-                            isLoading = false
-                            onSignedIn()
+                        .addOnSuccessListener { authResult ->
+                            continuePhoneSignInIfRegistered(authResult.user)
                         }
                         .addOnFailureListener { exception ->
                             isLoading = false
@@ -2837,9 +2888,8 @@ fun LoginScreen(
 
         auth
             .signInWithCredential(credential)
-            .addOnSuccessListener {
-                isLoading = false
-                onSignedIn()
+            .addOnSuccessListener { authResult ->
+                continuePhoneSignInIfRegistered(authResult.user)
             }
             .addOnFailureListener { exception ->
                 isLoading = false
@@ -3276,17 +3326,32 @@ fun SignUpScreen(
                 finishAccountCreation(linkedUser)
             }
             .addOnFailureListener { exception ->
-                isLoading = false
+                // PhoneAuth sign-in can return an existing account. If that
+                // account already has an email/password provider (or the email
+                // belongs to another UID), do not pretend a new registration
+                // succeeded and do not overwrite the other account's profile.
+                val detail = exception.message.orEmpty()
+                val authErrorCode =
+                    (exception as? FirebaseAuthException)?.errorCode.orEmpty()
+                val providerAlreadyLinked =
+                    authErrorCode.contains("PROVIDER_ALREADY_LINKED", ignoreCase = true) ||
+                        detail.contains("provider-already-linked", ignoreCase = true) ||
+                        detail.contains("provider already linked", ignoreCase = true)
+                val credentialCollision =
+                    exception is FirebaseAuthUserCollisionException ||
+                        authErrorCode.contains("CREDENTIAL_ALREADY_IN_USE", ignoreCase = true) ||
+                        authErrorCode.contains("EMAIL_ALREADY_IN_USE", ignoreCase = true) ||
+                        detail.contains("credential-already-in-use", ignoreCase = true) ||
+                        detail.contains("email-already-in-use", ignoreCase = true)
 
-                if (
-                    exception.message.orEmpty().contains(
-                        "provider-already-linked",
-                        ignoreCase = true
-                    )
-                ) {
-                    finishAccountCreation(user)
-                } else {
-                    errorText =
+                auth.signOut()
+                isLoading = false
+                errorText = when {
+                    providerAlreadyLinked ->
+                        "This phone number is already linked to a GeoFare account. Sign in with that existing account instead."
+                    credentialCollision ->
+                        "This email is already associated with another account. Sign in to that account or use a different email."
+                    else ->
                         friendlyFirebaseAuthError(exception)
                 }
             }
@@ -4437,106 +4502,21 @@ fun ReportSubmittedScreen(
    Google Lens can scan it and open the website.
    ========================================================= */
 
+const val DRIVER_CONFIRMATION_URL = "https://geofare-trip-confirmation.web.app/"
+
+/**
+ * The QR contains only a trip ID and short-lived bearer token. The browser
+ * calls the trusted backend to validate the token and fetch authorized fields.
+ */
 fun buildWebsiteTripUrl(
-
     tripId: String,
-
-    plate: String,
-
-    pickup: Location?,
-
-    destination: GeoPoint?,
-
-    distanceMeters: Double,
-
-    fare: Double,
-
-    timestamp: String
-
+    token: String
 ): String {
-
-    val pickupLatitude =
-        pickup?.latitude ?: 0.0
-
-    val pickupLongitude =
-        pickup?.longitude ?: 0.0
-
-    val destinationLatitude =
-        destination?.latitude ?: 0.0
-
-    val destinationLongitude =
-        destination?.longitude ?: 0.0
-
-    val distanceKm =
-        String.format(
-            Locale.US,
-            "%.2f",
-            distanceMeters / 1000.0
-        )
-
-    val fareString =
-        String.format(
-            Locale.US,
-            "%.2f",
-            fare
-        )
-
-    return Uri.Builder()
-        .scheme("https")
-        .authority("geofare-79da3.web.app")
-        .path("/")
-        .appendQueryParameter(
-            "tripId",
-            tripId
-        )
-        .appendQueryParameter(
-            "plate",
-            plate.ifBlank { "UNKNOWN" }
-        )
-        .appendQueryParameter(
-            "pickupLat",
-            String.format(
-                Locale.US,
-                "%.6f",
-                pickupLatitude
-            )
-        )
-        .appendQueryParameter(
-            "pickupLng",
-            String.format(
-                Locale.US,
-                "%.6f",
-                pickupLongitude
-            )
-        )
-        .appendQueryParameter(
-            "destLat",
-            String.format(
-                Locale.US,
-                "%.6f",
-                destinationLatitude
-            )
-        )
-        .appendQueryParameter(
-            "destLng",
-            String.format(
-                Locale.US,
-                "%.6f",
-                destinationLongitude
-            )
-        )
-        .appendQueryParameter(
-            "distance",
-            distanceKm
-        )
-        .appendQueryParameter(
-            "fare",
-            fareString
-        )
-        .appendQueryParameter(
-            "timestamp",
-            timestamp
-        )
+    // Keep the bearer token in the URL fragment. Fragments are not sent in
+    // HTTP requests, reducing exposure in hosting/request logs and Referer data.
+    return Uri.parse(DRIVER_CONFIRMATION_URL)
+        .buildUpon()
+        .encodedFragment("tripId=$tripId&token=$token")
         .build()
         .toString()
 }
@@ -8748,7 +8728,9 @@ fun FareEstimateScreen(
     fare: Double,
     onFareDisplayed: () -> Unit,
     onBack: () -> Unit,
-    onConfirmFare: () -> Unit
+    onConfirmFare: () -> Unit,
+    saveError: String = "",
+    isSaving: Boolean = false
 ) {
 
     val distanceKm =
@@ -8817,6 +8799,16 @@ fun FareEstimateScreen(
                 color =
                     Color(0xFF71879B)
             )
+
+            if (saveError.isNotBlank()) {
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    text = saveError,
+                    color = Color(0xFFB3261E),
+                    fontSize = 13.sp,
+                    textAlign = TextAlign.Center
+                )
+            }
 
             Spacer(
                 modifier =
@@ -9086,6 +9078,8 @@ fun FareEstimateScreen(
                 onClick =
                     onConfirmFare,
 
+                enabled = !isSaving,
+
                 modifier =
                     Modifier
                         .fillMaxWidth()
@@ -9101,16 +9095,19 @@ fun FareEstimateScreen(
                     )
             ) {
 
-                Text(
-                    text =
-                        "CONFIRM TRIP",
-
-                    fontSize =
-                        18.sp,
-
-                    fontWeight =
-                        FontWeight.Bold
-                )
+                if (isSaving) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(20.dp),
+                        strokeWidth = 2.dp,
+                        color = Color.White
+                    )
+                } else {
+                    Text(
+                        text = "CONFIRM TRIP",
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
             }
 
             Spacer(
@@ -10112,7 +10109,9 @@ fun RouteMonitoringScreen(
                         "ACTIVE",
 
                     routeStatus =
-                        "WAITING_FOR_GPS"
+                        "WAITING_FOR_GPS",
+
+                    markStarted = true
                 )
 
 
@@ -10939,6 +10938,8 @@ fun updateAndroidTripStatus(
 
     distanceFromRoute: Double? = null,
 
+    markStarted: Boolean = false,
+
     onSuccess: (() -> Unit)? = null,
 
     onFailure: ((Exception) -> Unit)? = null
@@ -10973,8 +10974,7 @@ fun updateAndroidTripStatus(
                     distanceFromRoute
             }
 
-            if (status == "ACTIVE") {
-
+            if (status == "ACTIVE" && markStarted) {
                 updates["startedAt"] =
                     com.google.firebase.firestore.FieldValue.serverTimestamp()
             }
@@ -11000,30 +11000,14 @@ fun updateAndroidTripStatus(
                     onSuccess?.invoke()
                 }
                 .addOnFailureListener { updateException ->
-
-                    geoFareFirestore
-                        .collection("trips")
-                        .document(tripId)
-                        .set(
-                            updates,
-                            com.google.firebase.firestore.SetOptions.merge()
-                        )
-                        .addOnSuccessListener {
-
-                            onSuccess?.invoke()
-                        }
-                        .addOnFailureListener { fallbackException ->
-
-                            Log.e(
-                                "GeoFareFirebase",
-                                "Trip status update failed: $updateException",
-                                fallbackException
-                            )
-
-                            onFailure?.invoke(
-                                fallbackException
-                            )
-                        }
+                    // Never create a trip as a side-effect of a status update.
+                    // A missing/inaccessible trip must remain a hard failure.
+                    Log.e(
+                        "GeoFareFirebase",
+                        "Trip status update failed",
+                        updateException
+                    )
+                    onFailure?.invoke(updateException)
                 }
 
         },

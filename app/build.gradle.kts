@@ -159,6 +159,10 @@ dependencies {
         "com.google.firebase:firebase-firestore"
     )
 
+    implementation(
+        "com.google.firebase:firebase-functions"
+    )
+
 
     // =====================================================
     // GOOGLE SIGN-IN

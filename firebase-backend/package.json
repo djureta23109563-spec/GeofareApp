@@ -1,0 +1,20 @@
+{
+  "name": "geofare-secure-trip-confirmation",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "22"
+  },
+  "scripts": {
+    "test": "node --check functions/index.mjs && node --check functions/token-utils.mjs && node --check public/app.js && node --test",
+    "serve": "firebase emulators:start --only functions,firestore,hosting",
+    "deploy": "firebase deploy --only functions,hosting,firestore:rules"
+  },
+  "dependencies": {
+    "firebase-admin": "^13.0.0",
+    "firebase-functions": "^6.0.0"
+  },
+  "devDependencies": {
+    "firebase-tools": "^13.29.0"
+  }
+}
