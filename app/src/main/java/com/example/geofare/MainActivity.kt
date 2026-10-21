@@ -4459,7 +4459,7 @@ fun buildWebsiteTripUrl(
     return Uri.Builder()
         .scheme("https")
         .authority("geofare-trip-confirmation.web.app")
-        .path("confirm.html")
+        .path("/")
         .appendQueryParameter("tripId", tripId)
         .appendQueryParameter("token", token)
         .build()
