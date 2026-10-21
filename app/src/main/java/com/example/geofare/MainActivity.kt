@@ -20,6 +20,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import android.util.Patterns
+import android.util.Base64
 
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -123,6 +124,8 @@ import org.osmdroid.views.overlay.mylocation.GpsMyLocationProvider
 import org.osmdroid.views.overlay.mylocation.MyLocationNewOverlay
 
 import java.io.File
+import java.security.MessageDigest
+import java.security.SecureRandom
 import java.net.HttpURLConnection
 import java.net.URL
 import java.text.SimpleDateFormat
@@ -502,6 +505,7 @@ suspend fun completeGeoFareGoogleSignIn(
 
 fun saveTripToFirestore(
     tripId: String,
+    qrTokenHash: String,
     plate: String,
     pickup: Location?,
     pickupAddress: String,
@@ -524,6 +528,7 @@ fun saveTripToFirestore(
                 hashMapOf<String, Any?>(
                     "tripId" to tripId,
                     "passengerUid" to user.uid,
+                    "qrTokenHash" to qrTokenHash,
                     "plate" to plate.ifBlank { "UNKNOWN" },
                     "pickupLat" to (pickup?.latitude ?: 0.0),
                     "pickupLng" to (pickup?.longitude ?: 0.0),
@@ -929,7 +934,9 @@ fun GeoFareApp() {
     var fareComputationLatencyMs by remember { mutableStateOf<Long?>(null) }
 
     var tripId by remember { mutableStateOf("") }
+    var qrToken by remember { mutableStateOf("") }
     var qrPayload by remember { mutableStateOf("") }
+    var isSavingTrip by remember { mutableStateOf(false) }
     var firebaseError by remember { mutableStateOf("") }
     var completionTimestamp by remember { mutableStateOf("") }
     var selectedHistoryTrip by remember { mutableStateOf<TripHistoryItem?>(null) }
@@ -953,7 +960,9 @@ fun GeoFareApp() {
         fareComputationLatencyMs = null
 
         tripId = ""
+        qrToken = ""
         qrPayload = ""
+        isSavingTrip = false
         firebaseError = ""
         completionTimestamp = ""
     }
@@ -1202,15 +1211,22 @@ fun GeoFareApp() {
                     }
                 },
                 onBack = {
+                    firebaseError = ""
                     currentScreen = "DESTINATION"
                 },
+                saveError = firebaseError,
+                isSaving = isSavingTrip,
                 onConfirmFare = {
-                    tripId =
-                        "GF-" +
-                                UUID.randomUUID()
-                                    .toString()
-                                    .take(8)
-                                    .uppercase()
+                    if (isSavingTrip) return@FareEstimateScreen
+
+                    isSavingTrip = true
+                    firebaseError = ""
+                    tripId = "GF-" + UUID.randomUUID().toString().uppercase()
+                    qrToken = createSecureTripQrToken()
+                    qrPayload = buildWebsiteTripUrl(
+                        tripId = tripId,
+                        token = qrToken
+                    )
 
                     val timestamp =
                         SimpleDateFormat(
@@ -1233,20 +1249,9 @@ fun GeoFareApp() {
                             }
                     }
 
-                    qrPayload =
-                        buildWebsiteTripUrl(
-                            tripId = tripId,
-                            plate = detectedPlate,
-                            pickup = pickupLocation,
-                            destination = destinationLocation,
-                            distanceMeters =
-                                routeDistanceMeters ?: 0.0,
-                            fare = calculatedFare ?: 0.0,
-                            timestamp = timestamp
-                        )
-
                     saveTripToFirestore(
                         tripId = tripId,
+                        qrTokenHash = sha256Hex(qrToken),
                         plate = detectedPlate,
                         pickup = pickupLocation,
                         pickupAddress = pickupAddress,
@@ -1277,21 +1282,26 @@ fun GeoFareApp() {
                         fareComputationLatencyMs =
                             fareComputationLatencyMs,
                         onSuccess = {
+                            isSavingTrip = false
                             firebaseError = ""
                             currentScreen = "QR"
                         },
                         onFailure = { exception ->
+                            isSavingTrip = false
+                            qrPayload = ""
+                            qrToken = ""
+                            tripId = ""
                             firebaseError =
-                                exception.message
-                                    ?: "Unable to save trip to Firebase."
+                                "Trip could not be saved. No QR code was issued. " +
+                                    (exception.message ?: "Check your connection and try again.")
 
                             Log.e(
                                 "GeoFareFirebase",
-                                "Initial trip save failed",
+                                "Initial trip save failed; QR issuance blocked",
                                 exception
                             )
 
-                            currentScreen = "QR"
+                            currentScreen = "FARE"
                         }
                     )
                 }
@@ -4437,106 +4447,39 @@ fun ReportSubmittedScreen(
    Google Lens can scan it and open the website.
    ========================================================= */
 
+const val DRIVER_CONFIRMATION_URL = "https://geofare-trip-confirmation.web.app/confirm.html"
+
+fun createSecureTripQrToken(): String {
+    val bytes = ByteArray(32)
+    SecureRandom().nextBytes(bytes)
+    return Base64.encodeToString(
+        bytes,
+        Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING
+    )
+}
+
+fun sha256Hex(value: String): String {
+    val digest = MessageDigest.getInstance("SHA-256")
+        .digest(value.toByteArray(Charsets.UTF_8))
+    return digest.joinToString("") { byte ->
+        "%02x".format(byte.toInt() and 0xff)
+    }
+}
+
+/**
+ * The QR contains only a trip ID and short-lived bearer token. The browser
+ * calls the trusted backend to validate the token and fetch authorized fields.
+ */
 fun buildWebsiteTripUrl(
-
     tripId: String,
-
-    plate: String,
-
-    pickup: Location?,
-
-    destination: GeoPoint?,
-
-    distanceMeters: Double,
-
-    fare: Double,
-
-    timestamp: String
-
+    token: String
 ): String {
-
-    val pickupLatitude =
-        pickup?.latitude ?: 0.0
-
-    val pickupLongitude =
-        pickup?.longitude ?: 0.0
-
-    val destinationLatitude =
-        destination?.latitude ?: 0.0
-
-    val destinationLongitude =
-        destination?.longitude ?: 0.0
-
-    val distanceKm =
-        String.format(
-            Locale.US,
-            "%.2f",
-            distanceMeters / 1000.0
-        )
-
-    val fareString =
-        String.format(
-            Locale.US,
-            "%.2f",
-            fare
-        )
-
     return Uri.Builder()
         .scheme("https")
-        .authority("geofare-79da3.web.app")
-        .path("/")
-        .appendQueryParameter(
-            "tripId",
-            tripId
-        )
-        .appendQueryParameter(
-            "plate",
-            plate.ifBlank { "UNKNOWN" }
-        )
-        .appendQueryParameter(
-            "pickupLat",
-            String.format(
-                Locale.US,
-                "%.6f",
-                pickupLatitude
-            )
-        )
-        .appendQueryParameter(
-            "pickupLng",
-            String.format(
-                Locale.US,
-                "%.6f",
-                pickupLongitude
-            )
-        )
-        .appendQueryParameter(
-            "destLat",
-            String.format(
-                Locale.US,
-                "%.6f",
-                destinationLatitude
-            )
-        )
-        .appendQueryParameter(
-            "destLng",
-            String.format(
-                Locale.US,
-                "%.6f",
-                destinationLongitude
-            )
-        )
-        .appendQueryParameter(
-            "distance",
-            distanceKm
-        )
-        .appendQueryParameter(
-            "fare",
-            fareString
-        )
-        .appendQueryParameter(
-            "timestamp",
-            timestamp
-        )
+        .authority("geofare-trip-confirmation.web.app")
+        .path("confirm.html")
+        .appendQueryParameter("tripId", tripId)
+        .appendQueryParameter("token", token)
         .build()
         .toString()
 }
@@ -8748,7 +8691,9 @@ fun FareEstimateScreen(
     fare: Double,
     onFareDisplayed: () -> Unit,
     onBack: () -> Unit,
-    onConfirmFare: () -> Unit
+    onConfirmFare: () -> Unit,
+    saveError: String = "",
+    isSaving: Boolean = false
 ) {
 
     val distanceKm =
@@ -8817,6 +8762,16 @@ fun FareEstimateScreen(
                 color =
                     Color(0xFF71879B)
             )
+
+            if (saveError.isNotBlank()) {
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    text = saveError,
+                    color = Color(0xFFB3261E),
+                    fontSize = 13.sp,
+                    textAlign = TextAlign.Center
+                )
+            }
 
             Spacer(
                 modifier =
@@ -9086,6 +9041,8 @@ fun FareEstimateScreen(
                 onClick =
                     onConfirmFare,
 
+                enabled = !isSaving,
+
                 modifier =
                     Modifier
                         .fillMaxWidth()
@@ -9101,16 +9058,19 @@ fun FareEstimateScreen(
                     )
             ) {
 
-                Text(
-                    text =
-                        "CONFIRM TRIP",
-
-                    fontSize =
-                        18.sp,
-
-                    fontWeight =
-                        FontWeight.Bold
-                )
+                if (isSaving) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(20.dp),
+                        strokeWidth = 2.dp,
+                        color = Color.White
+                    )
+                } else {
+                    Text(
+                        text = "CONFIRM TRIP",
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
             }
 
             Spacer(
