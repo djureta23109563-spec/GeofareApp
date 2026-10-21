@@ -43,6 +43,14 @@ node scripts/grant-driver.mjs FIREBASE_AUTH_UID
 
 The account must sign out and back in after its custom claim is set.
 
+Run the backend's unit tests before deployment:
+
+```bash
+npm test
+```
+
+These tests cover exact token matching, malformed token/hash rejection, and trip ID validation. Emulator-backed authorization/transaction tests and physical-device tests still need to be run in the Firebase project.
+
 Deploy the hosting page, callable functions, and the included Firestore rules:
 
 ```bash
