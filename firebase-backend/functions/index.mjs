@@ -1,4 +1,5 @@
-import { randomBytes, randomUUID, createHash, timingSafeEqual } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
+import { hashToken, tokenMatches, isValidTripId } from "./token-utils.mjs";
 import { initializeApp } from "firebase-admin/app";
 import { FieldValue, Timestamp, getFirestore } from "firebase-admin/firestore";
 import { setGlobalOptions } from "firebase-functions/v2";
@@ -54,22 +55,10 @@ function optionalFiniteNumber(value, label) {
   return value;
 }
 
-function hashToken(token) {
-  return createHash("sha256").update(token, "utf8").digest();
-}
-
-function tokenMatches(storedHex, token) {
-  if (typeof storedHex !== "string" || !/^[0-9a-f]{64}$/i.test(storedHex)) return false;
-  if (typeof token !== "string" || token.length < 40 || token.length > 100) return false;
-  const expected = Buffer.from(storedHex, "hex");
-  const actual = hashToken(token);
-  return expected.length === actual.length && timingSafeEqual(expected, actual);
-}
-
 function getTripToken(request) {
   const tripId = cleanString(request.data?.tripId, "trip identifier", 100);
   const token = cleanString(request.data?.token, "QR token", 120);
-  if (!/^GF-[0-9A-F-]{20,60}$/i.test(tripId)) {
+  if (!isValidTripId(tripId)) {
     throw new HttpsError("invalid-argument", "This QR code is invalid. Scan the trip QR again.");
   }
   return { tripId, token };
