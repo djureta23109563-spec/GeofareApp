@@ -4,7 +4,10 @@ import {
   onAuthStateChanged,
   signInWithEmailAndPassword,
   signOut,
-  getIdTokenResult
+  getIdTokenResult,
+  GoogleAuthProvider,
+  signInWithRedirect,
+  getRedirectResult
 } from "https://www.gstatic.com/firebasejs/11.10.0/firebase-auth.js";
 import { getFunctions, httpsCallable } from "https://www.gstatic.com/firebasejs/11.10.0/firebase-functions.js";
 
@@ -12,18 +15,36 @@ const config = window.GEOFARE_FIREBASE_CONFIG;
 const statusEl = document.querySelector("#status");
 const loginForm = document.querySelector("#login-form");
 const loginButton = document.querySelector("#login-button");
+const googleButton = document.querySelector("#google-button");
 const signoutButton = document.querySelector("#signout-button");
 const tripCard = document.querySelector("#trip-card");
 const confirmButton = document.querySelector("#confirm-button");
 
-// New QR codes put the bearer token in the fragment so it isn't sent to
-// the hosting server. Query support is retained for older links if present.
+// New QR codes put the bearer token in the fragment so it isn't sent to the
+// hosting server. Query support is retained for older links if present.
+const pendingQrKey = "geofare_pending_qr_v1";
 const params = new URLSearchParams(window.location.search);
 const fragmentParams = new URLSearchParams(window.location.hash.slice(1));
-const tripId = fragmentParams.get("tripId") || params.get("tripId") || "";
-const token = fragmentParams.get("token") || params.get("token") || "";
-// Do not leave the bearer token visible in the address bar/history longer than
-// necessary. The page keeps it only in memory; it is not placed in localStorage.
+let tripId = fragmentParams.get("tripId") || params.get("tripId") || "";
+let token = fragmentParams.get("token") || params.get("token") || "";
+
+// Google sign-in uses a full-page redirect on mobile. A short-lived sessionStorage
+// entry preserves the QR for that redirect only; Firestore remains the source of
+// trip state and the backend still validates the token and expiry.
+try {
+  if (!tripId || !token) {
+    const pending = JSON.parse(sessionStorage.getItem(pendingQrKey) || "null");
+    if (pending && Date.now() - pending.savedAt < 10 * 60 * 1000) {
+      tripId = tripId || pending.tripId || "";
+      token = token || pending.token || "";
+    }
+  }
+  sessionStorage.removeItem(pendingQrKey);
+} catch {
+  // If session storage is unavailable, email/password sign-in remains available.
+}
+
+// Do not leave credentials in the address bar/history after they have been read.
 window.history.replaceState({}, document.title, window.location.pathname);
 
 let auth;
@@ -53,6 +74,7 @@ function errorMessage(error) {
 }
 function setBusy(busy) {
   loginButton.disabled = busy;
+  googleButton.disabled = busy;
   confirmButton.disabled = busy;
 }
 function formatMoney(value) {
@@ -88,6 +110,7 @@ async function loadTrip() {
 if (!config || !config.apiKey || !config.projectId || !config.authDomain || !config.appId || config.appId.startsWith("REPLACE_")) {
   showStatus("Firebase web configuration is incomplete. Check firebase-backend/public/firebase-config.js.");
   loginForm.hidden = true;
+  googleButton.hidden = true;
 } else {
   const app = initializeApp(config);
   auth = getAuth(app);
@@ -109,6 +132,30 @@ if (!config || !config.apiKey || !config.projectId || !config.authDomain || !con
       showStatus(errorMessage(error), "error");
       setBusy(false);
     }
+  });
+
+  googleButton.addEventListener("click", async () => {
+    setBusy(true);
+    showStatus("Opening Google sign-in…");
+    try {
+      // Keep a QR only across the OAuth redirect in this same browser tab.
+      if (tripId && token) {
+        sessionStorage.setItem(
+          pendingQrKey,
+          JSON.stringify({ tripId, token, savedAt: Date.now() })
+        );
+      }
+      await signInWithRedirect(auth, new GoogleAuthProvider());
+    } catch (error) {
+      sessionStorage.removeItem(pendingQrKey);
+      showStatus(errorMessage(error), "error");
+      setBusy(false);
+    }
+  });
+
+  getRedirectResult(auth).catch((error) => {
+    sessionStorage.removeItem(pendingQrKey);
+    showStatus(errorMessage(error), "error");
   });
 
   signoutButton.addEventListener("click", async () => {
@@ -147,6 +194,7 @@ if (!config || !config.apiKey || !config.projectId || !config.authDomain || !con
     tripCard.hidden = true;
     previewedTrip = null;
     loginForm.hidden = Boolean(user);
+    googleButton.hidden = Boolean(user);
     signoutButton.hidden = !user;
     if (!user) {
       showStatus(tripId && token
