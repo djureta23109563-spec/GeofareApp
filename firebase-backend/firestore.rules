@@ -1,0 +1,81 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    function isPassengerTrackingUpdate() {
+      return signedIn()
+        && resource.data.passengerUid == request.auth.uid
+        && resource.data.status in ['CONFIRMED', 'ACTIVE', 'ON_ROUTE', 'ROUTE_DEVIATION']
+        && request.resource.data.status in ['ACTIVE', 'ON_ROUTE', 'ROUTE_DEVIATION', 'COMPLETED']
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'status',
+          'routeStatus',
+          'liveLocation',
+          'distanceFromRouteMeters',
+          'startedAt',
+          'completedAt',
+          'monitoringEndedAt'
+        ])
+        && (
+          !('startedAt' in resource.data)
+          || !request.resource.data.diff(resource.data).affectedKeys().hasAny(['startedAt'])
+        )
+        && request.resource.data.passengerUid == resource.data.passengerUid
+        && request.resource.data.qrTokenHash == resource.data.qrTokenHash;
+    }
+
+    match /profiles/{uid} {
+      allow get: if isOwner(uid);
+      allow list: if false;
+      allow create: if isOwner(uid)
+        && request.resource.data.uid == uid
+        && request.resource.data.keys().hasOnly([
+          'uid', 'fullName', 'email', 'phoneNumber', 'updatedAt'
+        ]);
+      allow update: if isOwner(uid)
+        && request.resource.data.uid == uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'fullName', 'email', 'phoneNumber', 'updatedAt'
+        ]);
+      allow delete: if false;
+    }
+
+    match /trips/{tripId} {
+      // Driver lookup and CONFIRMED state changes happen only through
+      // authenticated Cloud Functions; QR tokens are checked server-side.
+      allow get: if signedIn()
+        && (
+          resource.data.passengerUid == request.auth.uid
+          || resource.data.driverUid == request.auth.uid
+        );
+      allow list: if signedIn()
+        && resource.data.passengerUid == request.auth.uid;
+      allow create, delete: if false;
+      allow update: if isPassengerTrackingUpdate();
+    }
+
+    match /reports/{reportId} {
+      allow create: if signedIn()
+        && request.resource.data.passengerUid == request.auth.uid
+        && request.resource.data.keys().hasOnly([
+          'reportId', 'tripId', 'passengerUid', 'plate', 'distanceKm',
+          'fare', 'reportType', 'description', 'tripStatus', 'status', 'createdAt'
+        ]);
+      allow get, list: if signedIn()
+        && resource.data.passengerUid == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
