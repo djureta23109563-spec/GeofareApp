@@ -82,7 +82,7 @@ async function loadTrip() {
   showStatus("Trip verified. Check the plate, destination, and estimated fare before confirming.", "success");
 }
 
-if (!config || !config.apiKey || !config.projectId || !config.authDomain) {
+if (!config || !config.apiKey || !config.projectId || !config.authDomain || !config.appId || config.appId.startsWith("REPLACE_")) {
   showStatus("Firebase web configuration is incomplete. Check firebase-backend/public/firebase-config.js.");
   loginForm.hidden = true;
 } else {
