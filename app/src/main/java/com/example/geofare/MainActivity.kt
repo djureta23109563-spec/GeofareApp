@@ -4446,7 +4446,7 @@ fun ReportSubmittedScreen(
    Google Lens can scan it and open the website.
    ========================================================= */
 
-const val DRIVER_CONFIRMATION_URL = "https://geofare-trip-confirmation.web.app/confirm.html"
+const val DRIVER_CONFIRMATION_URL = "https://geofare-trip-confirmation.web.app/"
 
 /**
  * The QR contains only a trip ID and short-lived bearer token. The browser
@@ -4456,12 +4456,13 @@ fun buildWebsiteTripUrl(
     tripId: String,
     token: String
 ): String {
+    // Keep the bearer token in the URL fragment. Fragments are not sent in
+    // HTTP requests, reducing exposure in hosting/request logs and Referer data.
     return Uri.Builder()
         .scheme("https")
         .authority("geofare-trip-confirmation.web.app")
         .path("/")
-        .appendQueryParameter("tripId", tripId)
-        .appendQueryParameter("token", token)
+        .encodedFragment("tripId=$tripId&token=$token")
         .build()
         .toString()
 }
