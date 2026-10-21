@@ -1,9 +1,8 @@
-// Firebase web client settings for the existing GeoFare project.
-// These values are public client configuration, not service-account credentials.
+// Copy these four values from Firebase Console → Project settings → Your apps
+// → the registered Web app. Do not paste a service-account key here.
 window.GEOFARE_FIREBASE_CONFIG = {
-  apiKey: "AIzaSyDJ0GxlM85A7brMFLJvlio4306IvOgCEew",
-  authDomain: "geofare-79da3.firebaseapp.com",
+  apiKey: "REPLACE_WITH_WEB_API_KEY",
+  authDomain: "REPLACE_WITH_WEB_AUTH_DOMAIN",
   projectId: "geofare-79da3",
-  // Register a Web app in Firebase Console and replace this placeholder.
-  appId: "REPLACE_WITH_WEB_APP_ID_FROM_FIREBASE_CONSOLE"
+  appId: "REPLACE_WITH_WEB_APP_ID"
 };
