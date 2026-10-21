@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta name="robots" content="noindex,nofollow">
+  <title>GeoFare · Driver Trip Confirmation</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/firebase-config.js"></script>
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <main class="page">
+    <header class="brand">
+      <div class="logo">GF</div>
+      <div>
+        <h1>GeoFare</h1>
+        <p>Secure driver trip confirmation</p>
+      </div>
+    </header>
+
+    <section class="panel">
+      <p class="eyebrow">CROSS-DEVICE TRIP</p>
+      <h2>Confirm passenger trip</h2>
+      <p class="muted">Sign in using your approved GeoFare driver account. The QR code is checked against the shared Firebase backend; it is not trusted just because it contains a trip ID.</p>
+
+      <div id="status" class="status" role="status" aria-live="polite">Checking QR code…</div>
+
+      <form id="login-form" class="stack" hidden>
+        <label for="email">Driver email</label>
+        <input id="email" type="email" autocomplete="username" required maxlength="254">
+        <label for="password">Password</label>
+        <input id="password" type="password" autocomplete="current-password" required maxlength="256>
+        <button type="submit" id="login-button">Sign in as driver</button>
+      </form>
+
+      <div id="trip-card" class="trip-card" hidden>
+        <div class="trip-heading">
+          <span>Trip</span>
+          <strong id="trip-id"></strong>
+        </div>
+        <dl>
+          <dt>Tricycle plate</dt><dd id="plate">—</dd>
+          <dt>Pickup</dt><dd id="pickup">—</dd>
+          <dt>Destination</dt><dd id="destination">—</dd>
+          <dt>Route distance</dt><dd id="distance">—</dd>
+          <dt>Estimated fare</dt><dd id="fare">—</dd>
+          <dt>QR expires</dt><dd id="expires">—</dd>
+        </dl>
+        <button id="confirm-button" type="button">Confirm this trip</button>
+      </div>
+
+      <button id="signout-button" class="secondary" type="button" hidden>Sign out / switch account</button>
+      <p class="footnote">QR tokens expire after 10 minutes and can confirm only one trip once. Never share a driver password or verification code.</p>
+    </section>
+  </main>
+</body>
+</html>
