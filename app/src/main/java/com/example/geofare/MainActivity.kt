@@ -145,6 +145,7 @@ import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
 import com.google.android.libraries.identity.googleid.GoogleIdTokenParsingException
 
 import com.google.firebase.FirebaseException
+import com.google.firebase.auth.FirebaseAuthException
 import com.google.firebase.auth.FirebaseAuthUserCollisionException
 import com.google.firebase.auth.EmailAuthProvider
 import com.google.firebase.auth.FirebaseAuth
@@ -3330,11 +3331,16 @@ fun SignUpScreen(
                 // belongs to another UID), do not pretend a new registration
                 // succeeded and do not overwrite the other account's profile.
                 val detail = exception.message.orEmpty()
+                val authErrorCode =
+                    (exception as? FirebaseAuthException)?.errorCode.orEmpty()
                 val providerAlreadyLinked =
-                    detail.contains("provider-already-linked", ignoreCase = true) ||
+                    authErrorCode.contains("PROVIDER_ALREADY_LINKED", ignoreCase = true) ||
+                        detail.contains("provider-already-linked", ignoreCase = true) ||
                         detail.contains("provider already linked", ignoreCase = true)
                 val credentialCollision =
                     exception is FirebaseAuthUserCollisionException ||
+                        authErrorCode.contains("CREDENTIAL_ALREADY_IN_USE", ignoreCase = true) ||
+                        authErrorCode.contains("EMAIL_ALREADY_IN_USE", ignoreCase = true) ||
                         detail.contains("credential-already-in-use", ignoreCase = true) ||
                         detail.contains("email-already-in-use", ignoreCase = true)
 
