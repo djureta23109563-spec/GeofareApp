@@ -6,7 +6,7 @@ This folder provides a cross-device trip confirmation flow for the Android app.
 
 1. Android calls `createPassengerTrip` in Firebase Functions using the signed-in passenger's Firebase session.
 2. The function creates the canonical trip ID, creates a random 256-bit QR token, stores only its SHA-256 digest and a server-side 10-minute expiry, then returns the trip ID and raw token once.
-3. The QR opens the separate Firebase Hosting site `https://geofare-trip-confirmation.web.app/confirm.html?tripId=...&token=...`.
+3. The QR opens the separate Firebase Hosting site `https://geofare-trip-confirmation.web.app/?tripId=...&token=...`.
 4. The driver signs in with Firebase Authentication. Cloud Functions require the server-managed custom claim `driver: true`.
 5. `lookupTripForDriver` validates the one-time token and expiry before returning a minimal trip summary. `confirmTrip` rechecks everything in a Firestore transaction and changes PENDING to CONFIRMED. Only the first confirmation succeeds.
 6. Firestore rules prohibit clients from creating trips or setting CONFIRMED directly. They allow a passenger to update a narrow set of monitoring fields after confirmation.
@@ -15,7 +15,7 @@ No driver role is assigned by the website. Do not add a client-side role selecto
 
 ## One-time setup
 
-Requirements: Firebase CLI, Node.js 20, permission to administer the existing `geofare-79da3` Firebase project, and billing enabled if your Firebase Functions plan requires it.
+Requirements: Firebase CLI, Node.js 22, permission to administer the existing `geofare-79da3` Firebase project, and billing enabled if your Firebase Functions plan requires it.
 
 From this folder:
 
