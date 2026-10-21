@@ -16,9 +16,12 @@ const signoutButton = document.querySelector("#signout-button");
 const tripCard = document.querySelector("#trip-card");
 const confirmButton = document.querySelector("#confirm-button");
 
+// New QR codes put the bearer token in the fragment so it isn't sent to
+// the hosting server. Query support is retained for older links if present.
 const params = new URLSearchParams(window.location.search);
-const tripId = params.get("tripId") || "";
-const token = params.get("token") || "";
+const fragmentParams = new URLSearchParams(window.location.hash.slice(1));
+const tripId = fragmentParams.get("tripId") || params.get("tripId") || "";
+const token = fragmentParams.get("token") || params.get("token") || "";
 // Do not leave the bearer token visible in the address bar/history longer than
 // necessary. The page keeps it only in memory; it is not placed in localStorage.
 window.history.replaceState({}, document.title, window.location.pathname);
