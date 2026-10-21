@@ -31,6 +31,8 @@ Create a **separate Hosting site** so the existing `geofare-79da3.web.app` site 
 npx firebase hosting:sites:create geofare-trip-confirmation --project geofare-79da3
 ```
 
+In Firebase Console → Project settings → General, register a **Web app** in project `geofare-79da3`. Copy that web app's `appId` into `public/firebase-config.js` (replace the `REPLACE_WITH_WEB_APP_ID_FROM_FIREBASE_CONSOLE` value). Also add `geofare-trip-confirmation.web.app` under Authentication → Settings → Authorized domains if it is not already listed. The website intentionally refuses to initialize while that value is still a placeholder.
+
 Verify Email/Password sign-in is enabled in Firebase Console → Authentication → Sign-in method. Create one account for the driver in Firebase Authentication. On the machine used for administration, configure Application Default Credentials or set `GOOGLE_APPLICATION_CREDENTIALS` to a service-account JSON kept outside the repository. Never commit that file.
 
 Grant the driver claim using the driver's Firebase Authentication UID (not their email address):
