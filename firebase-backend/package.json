@@ -6,7 +6,7 @@
     "node": "22"
   },
   "scripts": {
-    "test": "node --test",
+    "test": "node --check functions/index.mjs && node --check functions/token-utils.mjs && node --check public/app.js && node --test",
     "serve": "firebase emulators:start --only functions,firestore,hosting",
     "deploy": "firebase deploy --only functions,hosting,firestore:rules"
   },
