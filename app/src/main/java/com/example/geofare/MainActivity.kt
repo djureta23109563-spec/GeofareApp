@@ -4458,10 +4458,8 @@ fun buildWebsiteTripUrl(
 ): String {
     // Keep the bearer token in the URL fragment. Fragments are not sent in
     // HTTP requests, reducing exposure in hosting/request logs and Referer data.
-    return Uri.Builder()
-        .scheme("https")
-        .authority("geofare-trip-confirmation.web.app")
-        .path("/")
+    return Uri.parse(DRIVER_CONFIRMATION_URL)
+        .buildUpon()
         .encodedFragment("tripId=$tripId&token=$token")
         .build()
         .toString()
