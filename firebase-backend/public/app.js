@@ -147,14 +147,14 @@ if (!config || !config.apiKey || !config.projectId || !config.authDomain || !con
       }
       await signInWithRedirect(auth, new GoogleAuthProvider());
     } catch (error) {
-      sessionStorage.removeItem(pendingQrKey);
+      try { sessionStorage.removeItem(pendingQrKey); } catch { /* browser storage may be unavailable */ }
       showStatus(errorMessage(error), "error");
       setBusy(false);
     }
   });
 
   getRedirectResult(auth).catch((error) => {
-    sessionStorage.removeItem(pendingQrKey);
+    try { sessionStorage.removeItem(pendingQrKey); } catch { /* browser storage may be unavailable */ }
     showStatus(errorMessage(error), "error");
   });
 
