@@ -145,6 +145,7 @@ import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
 import com.google.android.libraries.identity.googleid.GoogleIdTokenParsingException
 
 import com.google.firebase.FirebaseException
+import com.google.firebase.auth.FirebaseAuthUserCollisionException
 import com.google.firebase.auth.EmailAuthProvider
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.GoogleAuthProvider
@@ -2753,6 +2754,47 @@ fun LoginScreen(
             }
     }
 
+    /**
+     * Firebase phone sign-in can create an auth-only user for an unknown
+     * number. Login must not silently become account registration; require the
+     * GeoFare profile created by the explicit sign-up flow before proceeding.
+     */
+    fun continuePhoneSignInIfRegistered(user: FirebaseUser?) {
+        if (user == null) {
+            auth.signOut()
+            isLoading = false
+            errorText = "Phone verification returned no GeoFare account. Please try again."
+            return
+        }
+
+        geoFareFirestore
+            .collection("profiles")
+            .document(user.uid)
+            .get()
+            .addOnSuccessListener { profile ->
+                isLoading = false
+                if (profile.exists()) {
+                    onSignedIn()
+                } else {
+                    auth.signOut()
+                    errorText =
+                        "No GeoFare account is registered with this phone number. " +
+                            "Choose Create Account first."
+                }
+            }
+            .addOnFailureListener { exception ->
+                auth.signOut()
+                isLoading = false
+                Log.e(
+                    "GeoFareAuth",
+                    "Unable to verify phone account profile",
+                    exception
+                )
+                errorText =
+                    "Unable to verify your GeoFare account. Check your connection and try again."
+            }
+    }
+
     fun requestPhoneCode() {
         val activity = context as? Activity
 
@@ -2782,9 +2824,8 @@ fun LoginScreen(
                 ) {
                     auth
                         .signInWithCredential(credential)
-                        .addOnSuccessListener {
-                            isLoading = false
-                            onSignedIn()
+                        .addOnSuccessListener { authResult ->
+                            continuePhoneSignInIfRegistered(authResult.user)
                         }
                         .addOnFailureListener { exception ->
                             isLoading = false
@@ -2846,9 +2887,8 @@ fun LoginScreen(
 
         auth
             .signInWithCredential(credential)
-            .addOnSuccessListener {
-                isLoading = false
-                onSignedIn()
+            .addOnSuccessListener { authResult ->
+                continuePhoneSignInIfRegistered(authResult.user)
             }
             .addOnFailureListener { exception ->
                 isLoading = false
@@ -3285,17 +3325,27 @@ fun SignUpScreen(
                 finishAccountCreation(linkedUser)
             }
             .addOnFailureListener { exception ->
-                isLoading = false
+                // PhoneAuth sign-in can return an existing account. If that
+                // account already has an email/password provider (or the email
+                // belongs to another UID), do not pretend a new registration
+                // succeeded and do not overwrite the other account's profile.
+                val detail = exception.message.orEmpty()
+                val providerAlreadyLinked =
+                    detail.contains("provider-already-linked", ignoreCase = true) ||
+                        detail.contains("provider already linked", ignoreCase = true)
+                val credentialCollision =
+                    exception is FirebaseAuthUserCollisionException ||
+                        detail.contains("credential-already-in-use", ignoreCase = true) ||
+                        detail.contains("email-already-in-use", ignoreCase = true)
 
-                if (
-                    exception.message.orEmpty().contains(
-                        "provider-already-linked",
-                        ignoreCase = true
-                    )
-                ) {
-                    finishAccountCreation(user)
-                } else {
-                    errorText =
+                auth.signOut()
+                isLoading = false
+                errorText = when {
+                    providerAlreadyLinked ->
+                        "This phone number is already linked to a GeoFare account. Sign in with that existing account instead."
+                    credentialCollision ->
+                        "This email is already associated with another account. Sign in to that account or use a different email."
+                    else ->
                         friendlyFirebaseAuthError(exception)
                 }
             }
