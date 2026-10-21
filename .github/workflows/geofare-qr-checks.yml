@@ -3,8 +3,6 @@ name: GeoFare QR confirmation checks
 on:
   pull_request:
     branches: [main]
-  push:
-    branches: [fix/secure-cross-device-qr-confirmation]
 
 permissions:
   contents: read
